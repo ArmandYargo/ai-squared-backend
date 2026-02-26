@@ -1,0 +1,13 @@
+Database:
+
+neondb
+
+Role:
+
+neondb_owner
+
+
+psql 
+"postgresql://neondb_owner:npg_guekI7lf5wAK@ep-snowy-wind-abnhygis-pooler.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+psql 'postgresql://neondb_owner:npg_guekI7lf5wAK@ep-snowy-wind-abnhygis-pooler.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'

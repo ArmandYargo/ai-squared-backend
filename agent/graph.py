@@ -16,7 +16,6 @@ except Exception:
     SqliteSaver = None
 
 from agent.state import AgentState
-from agent.rag import RagStore
 from agent.ram_tool import run_ram_pipeline_compat, check_ram_readiness
 
 # category helpers live in ram_module funcs (already in sys.path via ram_tool.py)
@@ -111,44 +110,6 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
 
 
 # -------------------------
-# RAG store singleton (lazy)
-# -------------------------
-_RAG_STORE: Optional[RagStore] = None
-
-
-def get_rag_store() -> RagStore:
-    global _RAG_STORE
-    if _RAG_STORE is None:
-        _RAG_STORE = RagStore()
-    return _RAG_STORE
-
-
-def _rag_search(store: RagStore, query: str, k: int = 6) -> List[Dict[str, Any]]:
-    """
-    Compatibility layer: your RagStore API may not be named 'search'.
-
-    We try common method names in order and normalize to:
-      [{"text": ..., "distance": ..., ...}, ...]
-    """
-    if hasattr(store, "search") and callable(getattr(store, "search")):
-        return store.search(query, k=k)  # type: ignore
-
-    for name in ("query", "retrieve", "similarity_search", "search_chunks", "search_similar"):
-        if hasattr(store, name) and callable(getattr(store, name)):
-            fn = getattr(store, name)
-            try:
-                res = fn(query, k=k)
-            except TypeError:
-                res = fn(query, top_k=k)
-            return res
-
-    raise AttributeError(
-        "RagStore has no supported retrieval method. "
-        "Expected one of: search/query/retrieve/similarity_search/search_chunks/search_similar"
-    )
-
-
-# -------------------------
 # Router node
 # -------------------------
 def node_router(state: AgentState) -> AgentState:
@@ -201,68 +162,42 @@ def node_router(state: AgentState) -> AgentState:
 # -------------------------
 # QA node
 # -------------------------
-RAG_MAX_DISTANCE = float(os.environ.get("RAG_MAX_DISTANCE", "0.4"))
-
-
 def node_qa(state: AgentState) -> AgentState:
+    print("[node_qa] entered", flush=True)
+
     msgs = state.get("messages") or []
     if not msgs:
-        state.setdefault("messages", []).append({"role": "assistant", "content": "How can I help?", "speaker": "LLM"})
+        state.setdefault("messages", []).append(
+            {"role": "assistant", "content": "How can I help?", "speaker": "LLM"}
+        )
         return state
 
     question = msgs[-1].get("content", "").strip()
+    print(f"[node_qa] question: {question}", flush=True)
+
     if not question:
         state.setdefault("messages", []).append(
             {"role": "assistant", "content": "Please enter a question.", "speaker": "LLM"}
         )
         return state
 
+    # TEMP: disable RAG completely for production stability
     hits = []
 
-    # Optional confidence filter if the store returns distances
-    if hits:
-        d0 = hits[0].get("distance", None)
-        if d0 is not None:
-            try:
-                if float(d0) > RAG_MAX_DISTANCE:
-                    hits = []
-            except Exception:
-                pass
-
-    if hits:
-        context = "\n\n".join([f"[{i}] {h.get('text','')}" for i, h in enumerate(hits, start=1)])
-        system = (
-            "You answer ONLY using the provided knowledge base context. "
-            "If the answer is not in the context, respond exactly with:\n"
-            "Not found in the knowledge base."
-        )
-        answer = _llm_text(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"QUESTION:\n{question}\n\nCONTEXT:\n{context}"},
-            ]
-        ).strip()
-
-        if answer == "Not found in the knowledge base.":
-            answer2 = _llm_text(
-                [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": question}]
-            ).strip()
-            state.setdefault("messages", []).append({"role": "assistant", "content": answer2, "speaker": "LLM"})
-        else:
-            state.setdefault("messages", []).append({"role": "assistant", "content": answer, "speaker": "RAG"})
-        return state
-
-    # fallback
+    print("[node_qa] before OpenAI call", flush=True)
     answer = _llm_text(
-        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": question}]
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": question},
+        ]
     ).strip()
-    state.setdefault("messages", []).append({"role": "assistant", "content": answer, "speaker": "LLM"})
+    print("[node_qa] after OpenAI call", flush=True)
+
+    state.setdefault("messages", []).append(
+        {"role": "assistant", "content": answer, "speaker": "LLM"}
+    )
     return state
 
-print("[node_qa] entered", flush=True)
-print(f"[node_qa] question: {question}", flush=True)
-print("[node_qa] before OpenAI call", flush=True)
-print("[node_qa] after OpenAI call", flush=True)
 
 # -------------------------
 # RAM Wizard + Simulation

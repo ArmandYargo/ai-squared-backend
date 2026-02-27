@@ -13,6 +13,7 @@ load_dotenv()
 
 # Import your graph
 from agent.graph import get_graph  # noqa: E402
+import traceback
 
 
 app = FastAPI(title="AI-Squared Backend", version="0.1.0")
@@ -60,9 +61,12 @@ def health():
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
+        print("=== /api/chat called ===", flush=True)
+        print("message:", req.message, flush=True)
+        print("session_id:", req.session_id, flush=True)
+
         session_id = req.session_id or str(uuid.uuid4())
 
-        # Start session state if new
         state = SESSIONS.get(session_id)
         if state is None:
             state = {
@@ -71,16 +75,16 @@ def chat(req: ChatRequest):
                 "intent": "qa",
             }
 
-        # Add user message
         state["messages"] = state.get("messages", []) + [
             {"role": "user", "content": req.message}
         ]
 
-        # Invoke graph (thread_id helps LangGraph checkpointing)
+        print("Before GRAPH.invoke", flush=True)
         out = GRAPH.invoke(state, config={"configurable": {"thread_id": session_id}})
+        print("After GRAPH.invoke", flush=True)
+
         SESSIONS[session_id] = out
 
-        # Find last assistant message
         msgs = out.get("messages", [])
         assistant_msg = None
         for m in reversed(msgs):
@@ -91,14 +95,18 @@ def chat(req: ChatRequest):
         if not assistant_msg:
             raise HTTPException(status_code=500, detail="No assistant response generated.")
 
+        print("Returning response", flush=True)
+
         return ChatResponse(
             session_id=session_id,
             reply=assistant_msg.get("content", ""),
             speaker=assistant_msg.get("speaker", "ASSISTANT"),
-            raw_state=None,  # set to out if you want to debug
+            raw_state=None,
         )
 
     except Exception as e:
+        print("=== ERROR in /api/chat ===", flush=True)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 

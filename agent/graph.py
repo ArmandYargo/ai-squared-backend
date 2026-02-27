@@ -217,8 +217,7 @@ def node_qa(state: AgentState) -> AgentState:
         )
         return state
 
-    store = get_rag_store()
-    hits = _rag_search(store, question, k=6) or []
+    hits = []
 
     # Optional confidence filter if the store returns distances
     if hits:
@@ -260,6 +259,10 @@ def node_qa(state: AgentState) -> AgentState:
     state.setdefault("messages", []).append({"role": "assistant", "content": answer, "speaker": "LLM"})
     return state
 
+print("[node_qa] entered", flush=True)
+print(f"[node_qa] question: {question}", flush=True)
+print("[node_qa] before OpenAI call", flush=True)
+print("[node_qa] after OpenAI call", flush=True)
 
 # -------------------------
 # RAM Wizard + Simulation

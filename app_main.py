@@ -7,12 +7,23 @@ import base64
 import hashlib
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+from db import (
+    list_conversations,
+    create_conversation,
+    get_conversation,
+    get_messages,
+    insert_message,
+    update_conversation_after_turn,
+    create_agent_run,
+    finish_agent_run,
+)
 
 # Load .env
 load_dotenv()
@@ -36,7 +47,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple in-memory chat session store
+# In-memory cache for active sessions
+# Neon is the source of truth; this just speeds up active conversations
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 # Build graph once
@@ -51,11 +63,13 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    session_id: Optional[str] = None  # backward compatibility
+    browser_id: Optional[str] = None  # will be used by frontend sidebar/history
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    conversation_id: str
     reply: str
     speaker: str = "ASSISTANT"
     raw_state: Optional[Dict[str, Any]] = None
@@ -63,6 +77,17 @@ class ChatResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     password: str
+
+
+class ConversationCreateRequest(BaseModel):
+    browser_id: Optional[str] = None
+    title: Optional[str] = None
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation_id: str
+    title: Optional[str] = None
+    messages: List[Dict[str, Any]]
 
 
 def _is_production() -> bool:
@@ -132,6 +157,18 @@ def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
 
+def _resolve_owner_key(browser_id: Optional[str]) -> str:
+    """
+    Temporary owner-key strategy until full user accounts are added.
+    Once the frontend sends a stable browser_id, each browser gets its own chat list.
+    For backward compatibility right now, fall back to a shared key.
+    """
+    browser_id = (browser_id or "").strip()
+    if browser_id:
+        return browser_id
+    return "shared-login-user"
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-squared-backend", "status": "running"}
@@ -186,27 +223,125 @@ def logout(response: Response):
     return {"ok": True}
 
 
+@app.get("/api/conversations")
+def api_list_conversations(request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    rows = list_conversations(owner_key)
+
+    return {
+        "items": [
+            {
+                "id": str(r["id"]),
+                "title": r.get("title"),
+                "last_message_preview": r.get("last_message_preview"),
+                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+                "last_message_at": r["last_message_at"].isoformat() if r.get("last_message_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/conversations")
+def api_create_conversation(req: ConversationCreateRequest, request: Request):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(req.browser_id)
+    row = create_conversation(owner_key, req.title)
+
+    return {
+        "conversation_id": str(row["id"]),
+        "title": row.get("title"),
+    }
+
+
+@app.get("/api/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+def api_get_conversation(conversation_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    conv = get_conversation(conversation_id, owner_key)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    msgs = get_messages(conversation_id)
+    return ConversationDetailResponse(
+        conversation_id=str(conv["id"]),
+        title=conv.get("title"),
+        messages=[
+            {
+                "id": str(m["id"]),
+                "role": m["role"],
+                "speaker": m.get("speaker"),
+                "content": m["content"],
+                "created_at": m["created_at"].isoformat() if m.get("created_at") else None,
+            }
+            for m in msgs
+        ],
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, request: Request):
     _require_auth(request)
 
     try:
-        session_id = req.session_id or str(uuid.uuid4())
+        owner_key = _resolve_owner_key(req.browser_id)
 
-        state = SESSIONS.get(session_id)
+        # Backward compatibility: accept old session_id from current frontend
+        conversation_id = req.conversation_id or req.session_id
+        conv = None
+
+        if conversation_id:
+            conv = get_conversation(conversation_id, owner_key)
+            if not conv:
+                # If the frontend still sends an old in-memory session id that isn't in Neon yet,
+                # create a fresh conversation so chat still works instead of hard failing.
+                conv = create_conversation(owner_key)
+                conversation_id = str(conv["id"])
+        else:
+            conv = create_conversation(owner_key)
+            conversation_id = str(conv["id"])
+
+        # Load from active in-memory cache first; otherwise from Neon last_state
+        state = SESSIONS.get(conversation_id)
         if state is None:
-            state = {
+            saved_state = conv.get("last_state") if conv else {}
+            state = saved_state or {
                 "messages": [],
                 "ram_wizard": {"active": False, "step": "machine"},
                 "intent": "qa",
             }
 
+        # Ensure base state keys exist
+        state.setdefault("messages", [])
+        state.setdefault("ram_wizard", {"active": False, "step": "machine"})
+        state.setdefault("intent", "qa")
+
+        # Save user message to DB
+        user_msg_row = insert_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=req.message,
+            speaker="USER",
+        )
+
+        # Add user message to working state
         state["messages"] = state.get("messages", []) + [
             {"role": "user", "content": req.message}
         ]
 
-        out = GRAPH.invoke(state, config={"configurable": {"thread_id": session_id}})
-        SESSIONS[session_id] = out
+        run = create_agent_run(
+            conversation_id=conversation_id,
+            message_id=str(user_msg_row["id"]),
+            run_type="chat_turn",
+            input_json={"message": req.message},
+        )
+
+        out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})
+        SESSIONS[conversation_id] = out
 
         msgs = out.get("messages", [])
         assistant_msg = None
@@ -216,12 +351,44 @@ def chat(req: ChatRequest, request: Request):
                 break
 
         if not assistant_msg:
+            finish_agent_run(
+                run_id=str(run["id"]),
+                status="failed",
+                error_json={"detail": "No assistant response generated."},
+            )
             raise HTTPException(status_code=500, detail="No assistant response generated.")
 
+        assistant_text = assistant_msg.get("content", "")
+        assistant_speaker = assistant_msg.get("speaker", "ASSISTANT")
+
+        insert_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=assistant_text,
+            speaker=assistant_speaker,
+        )
+
+        title = conv.get("title") if conv else None
+        if not title:
+            title = req.message[:60].strip()
+
+        update_conversation_after_turn(
+            conversation_id=conversation_id,
+            last_message_preview=assistant_text[:120],
+            last_state=out,
+            title=title,
+        )
+
+        finish_agent_run(
+            run_id=str(run["id"]),
+            status="completed",
+            result_json={"reply_preview": assistant_text[:200]},
+        )
+
         return ChatResponse(
-            session_id=session_id,
-            reply=assistant_msg.get("content", ""),
-            speaker=assistant_msg.get("speaker", "ASSISTANT"),
+            conversation_id=conversation_id,
+            reply=assistant_text,
+            speaker=assistant_speaker,
             raw_state=None,
         )
 
@@ -229,7 +396,7 @@ def chat(req: ChatRequest, request: Request):
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Backend processing error.")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.post("/api/upload")
@@ -250,15 +417,19 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "stored_as": safe_name,
             "server_path": str(out_path.resolve()),
         }
-    except Exception:
-        raise HTTPException(status_code=500, detail="Upload failed.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.post("/api/reset")
-def reset_session(session_id: str, request: Request = None):
-    if request is not None:
-        _require_auth(request)
+def reset_session(
+    request: Request,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    _require_auth(request)
 
-    if session_id in SESSIONS:
-        del SESSIONS[session_id]
-    return {"ok": True, "session_id": session_id}
+    key = conversation_id or session_id
+    if key and key in SESSIONS:
+        del SESSIONS[key]
+    return {"ok": True, "conversation_id": key}

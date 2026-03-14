@@ -76,7 +76,7 @@ def _looks_like_question(text: str) -> bool:
         return True
     return bool(
         re.match(
-            r"^(what|why|how|when|where|who|which|can you|could you|do you|is it|are you)\b",
+            r"^(what|why|how|when|where|who|which|can you|could you|do you|is it|are you|summarise|summarize|compare|review|analyse|analyze|explain)\b",
             t.lower(),
         )
     )
@@ -92,6 +92,7 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
         "or proceed with simulation steps.\n\n"
         "Rules:\n"
         "- If the user asks a question about regulations/laws/definitions/concepts, choose qa.\n"
+        "- If the user asks about an uploaded file, document, summary, comparison, or attached material, choose qa.\n"
         "- If the user is supplying a requested field (machine name, date range, file path) while wizard is active, choose ram_wizard.\n"
         "- If unclear, prefer qa.\n\n"
         "Output MUST be valid JSON with keys: intent, confidence, reason."
@@ -181,14 +182,51 @@ def node_qa(state: AgentState) -> AgentState:
         )
         return state
 
-    # TEMP: disable RAG completely for production stability
-    hits = []
+    artifact_context = (state.get("artifact_context") or "").strip()
+    artifact_meta = state.get("artifact_meta") or {}
+    used_titles = artifact_meta.get("used_artifact_titles") or []
+    skipped_artifacts = artifact_meta.get("skipped_artifacts") or []
+
+    system_prompt = (
+        "You are a helpful engineering and document-analysis assistant.\n"
+        "If document context is provided, answer using that material first.\n"
+        "Be explicit when your answer is based on uploaded documents.\n"
+        "If the uploaded documents do not contain the answer, say that clearly.\n"
+        "Do not pretend to have read attachments unless document context is actually present.\n"
+        "If useful, provide a concise structured answer."
+    )
+
+    user_parts: List[str] = []
+
+    if artifact_context:
+        user_parts.append(
+            "The following extracted document context comes from uploaded artifacts in this conversation.\n"
+            "Use it to answer the user's question.\n\n"
+            f"{artifact_context}"
+        )
+
+    if used_titles:
+        user_parts.append(
+            "Usable uploaded artifacts:\n" + "\n".join(f"- {title}" for title in used_titles)
+        )
+
+    if skipped_artifacts:
+        skipped_lines = [
+            f"- {item.get('title') or 'Untitled'}: {item.get('reason') or 'Skipped'}"
+            for item in skipped_artifacts
+        ]
+        user_parts.append(
+            "Some uploaded artifacts were not usable for text extraction:\n" + "\n".join(skipped_lines)
+        )
+
+    user_parts.append(f"User question:\n{question}")
+    combined_user_prompt = "\n\n".join(user_parts)
 
     print("[node_qa] before OpenAI call", flush=True)
     answer = _llm_text(
         [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": question},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": combined_user_prompt},
         ]
     ).strip()
     print("[node_qa] after OpenAI call", flush=True)
@@ -295,8 +333,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     wiz.setdefault("excel_path", None)
 
     # categories state
-    wiz.setdefault("categories", None)           # current working list
-    wiz.setdefault("categories_last_ai", None)   # last AI-proposed list (optional)
+    wiz.setdefault("categories", None)
+    wiz.setdefault("categories_last_ai", None)
 
     # readiness gate state
     wiz.setdefault("readiness_payload", None)
@@ -345,7 +383,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         return state
 
     user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
-    # NOTE: DO NOT strip here globally; we need to detect blank ENTER at categories step.
     user_text_stripped = user_text.strip()
 
     # ---------- machine ----------
@@ -386,7 +423,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         else:
             wiz["excel_path"] = user_text_stripped
 
-        # readiness check immediately after file selection
         _wizard_reply(state, f"Selected file:\n{wiz['excel_path']}\n\nRunning data readiness check...")
         try:
             payload = check_ram_readiness(
@@ -430,7 +466,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Please respond with: yes | pick file | cancel")
             return state
 
-        # move to category proposal/edit loop
         wiz["step"] = "categories_edit"
         if not wiz.get("categories"):
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
@@ -450,13 +485,11 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
     # ---------- categories edit: ENTER accepts, otherwise edit ----------
     if wiz["step"] == "categories_edit":
-        # Rule (1): ENTER means accept
         if user_text == "":
             wiz["step"] = "confirm_create"
             _wizard_reply(state, "Categories accepted.\n\nReady to create the RAM input sheet. Type 'yes' to proceed or 'no' to cancel.")
             return state
 
-        # Allow reset as a convenience
         if user_text_stripped.lower() == "reset":
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
             cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
@@ -470,7 +503,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             )
             return state
 
-        # Rule (2): anything else is an edit instruction (no "edit:" required)
         model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
         try:
             wiz["categories"] = ai_apply_edit_to_components(wiz.get("categories") or [], user_text_stripped, model=model)
@@ -478,7 +510,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, f"Edit failed: {type(e).__name__}: {e}\nTry a simpler edit (e.g., 'remove idler').")
             return state
 
-        # Show updated numbered list + prompt continue
         _wizard_reply(
             state,
             "Updated categories:\n"
@@ -506,7 +537,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             )
             return state
 
-        # Rule (4): anything else -> treat as another edit instruction on current list
         if t == "reset":
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
             cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
@@ -518,7 +548,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 f"{_format_numbered_categories(wiz['categories'])}\n\n"
                 "Continue with these categories? (Y/N)"
             )
-            # stay in confirm_or_edit so Y/N works after reset
             return state
 
         model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
@@ -654,7 +683,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["simulations"] = sims
         wiz["step"] = "sim_run"
         _wizard_reply(state, "Running simulation + archiving results...")
-        # fall through
 
     # ---------- sim run ----------
     if wiz["step"] == "sim_run":

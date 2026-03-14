@@ -294,3 +294,25 @@ def list_artifact_storage_keys_for_conversation(
         )
         rows = cur.fetchall()
         return [r["storage_key"] for r in rows if r.get("storage_key")]
+        
+def update_conversation_title(
+    conversation_id: str,
+    owner_key: str,
+    title: str,
+) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE app.conversations
+            SET title = %s,
+                updated_at = now()
+            WHERE id = %s
+              AND owner_key = %s
+              AND archived_at IS NULL
+            RETURNING *
+            """,
+            (title, conversation_id, owner_key),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row

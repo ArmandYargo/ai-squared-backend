@@ -7,7 +7,7 @@ import base64
 import hashlib
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,7 @@ from db import (
     delete_artifact,
     delete_conversation,
     list_artifact_storage_keys_for_conversation,
+    update_conversation_title,
 )
 
 # Load .env
@@ -60,6 +61,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COOKIE_NAME = "ai_squared_session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
+MAX_TEXT_PER_ARTIFACT = 18000
+MAX_TOTAL_ARTIFACT_CONTEXT = 45000
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -82,6 +86,11 @@ class LoginRequest(BaseModel):
 class ConversationCreateRequest(BaseModel):
     browser_id: Optional[str] = None
     title: Optional[str] = None
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str
+    browser_id: Optional[str] = None
 
 
 class ConversationDetailResponse(BaseModel):
@@ -173,6 +182,186 @@ def _safe_unlink(path_str: Optional[str]) -> None:
         pass
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[Truncated]"
+
+
+def _read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_json_file(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        obj = json.loads(raw)
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except Exception:
+        return raw
+
+
+def _read_csv_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_pdf_file(path: Path) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(str(path))
+        parts: List[str] = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n\n".join(parts).strip()
+    except Exception:
+        try:
+            import PyPDF2  # type: ignore
+
+            reader = PyPDF2.PdfReader(str(path))
+            parts = []
+            for page in reader.pages:
+                try:
+                    parts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            return "\n\n".join(parts).strip()
+        except Exception as e:
+            return f"[PDF extraction unavailable: {type(e).__name__}: {e}]"
+
+
+def _read_docx_file(path: Path) -> str:
+    try:
+        from docx import Document  # type: ignore
+
+        doc = Document(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        return "\n".join(parts).strip()
+    except Exception as e:
+        return f"[DOCX extraction unavailable: {type(e).__name__}: {e}]"
+
+
+def _extract_text_from_path(path_str: str, mime_type: Optional[str] = None) -> Tuple[bool, str]:
+    path = Path(path_str)
+    if not path.exists() or not path.is_file():
+        return False, "[File not found on server]"
+
+    suffix = path.suffix.lower()
+
+    try:
+        if suffix in {".txt", ".md"}:
+            return True, _read_text_file(path)
+        if suffix == ".json":
+            return True, _read_json_file(path)
+        if suffix == ".csv":
+            return True, _read_csv_file(path)
+        if suffix == ".pdf":
+            return True, _read_pdf_file(path)
+        if suffix == ".docx":
+            return True, _read_docx_file(path)
+
+        if mime_type:
+            if mime_type.startswith("text/"):
+                return True, _read_text_file(path)
+            if mime_type == "application/json":
+                return True, _read_json_file(path)
+
+        return False, f"[Unsupported file type for extraction: {suffix or mime_type or 'unknown'}]"
+    except Exception as e:
+        return False, f"[Failed to extract text: {type(e).__name__}: {e}]"
+
+
+def _build_artifact_context_for_conversation(conversation_id: str) -> Dict[str, Any]:
+    rows = list_artifacts(conversation_id)
+
+    supported_blocks: List[str] = []
+    used_artifact_ids: List[str] = []
+    used_titles: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    total_chars = 0
+
+    for row in rows:
+        if row.get("output_type") != "uploaded_file":
+            continue
+        if row.get("storage_provider") != "local":
+            skipped.append(
+                {
+                    "artifact_id": str(row["id"]),
+                    "title": row.get("title") or "Untitled artifact",
+                    "reason": "Unsupported storage provider",
+                }
+            )
+            continue
+
+        storage_key = row.get("storage_key")
+        if not storage_key:
+            skipped.append(
+                {
+                    "artifact_id": str(row["id"]),
+                    "title": row.get("title") or "Untitled artifact",
+                    "reason": "Missing storage key",
+                }
+            )
+            continue
+
+        ok, extracted = _extract_text_from_path(storage_key, row.get("mime_type"))
+        if not ok:
+            skipped.append(
+                {
+                    "artifact_id": str(row["id"]),
+                    "title": row.get("title") or "Untitled artifact",
+                    "reason": extracted,
+                }
+            )
+            continue
+
+        extracted = _truncate_text(extracted, MAX_TEXT_PER_ARTIFACT)
+        if not extracted.strip():
+            skipped.append(
+                {
+                    "artifact_id": str(row["id"]),
+                    "title": row.get("title") or "Untitled artifact",
+                    "reason": "No extractable text found",
+                }
+            )
+            continue
+
+        block = (
+            f"Document: {row.get('title') or 'Untitled'}\n"
+            f"Artifact ID: {row['id']}\n"
+            f"Mime type: {row.get('mime_type') or 'unknown'}\n\n"
+            f"{extracted}"
+        )
+
+        projected = total_chars + len(block)
+        if projected > MAX_TOTAL_ARTIFACT_CONTEXT:
+            remaining = MAX_TOTAL_ARTIFACT_CONTEXT - total_chars
+            if remaining > 500:
+                block = _truncate_text(block, remaining)
+                supported_blocks.append(block)
+                used_artifact_ids.append(str(row["id"]))
+                used_titles.append(row.get("title") or "Untitled artifact")
+            break
+
+        supported_blocks.append(block)
+        used_artifact_ids.append(str(row["id"]))
+        used_titles.append(row.get("title") or "Untitled artifact")
+        total_chars += len(block)
+
+    context_text = "\n\n" + ("\n\n" + ("-" * 80) + "\n\n").join(supported_blocks) if supported_blocks else ""
+
+    return {
+        "artifact_context": context_text.strip(),
+        "used_artifact_ids": used_artifact_ids,
+        "used_artifact_titles": used_titles,
+        "skipped_artifacts": skipped,
+    }
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-squared-backend", "status": "running"}
@@ -258,6 +447,31 @@ def api_create_conversation(req: ConversationCreateRequest, request: Request):
     return {
         "conversation_id": str(row["id"]),
         "title": row.get("title"),
+    }
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def api_rename_conversation(
+    conversation_id: str,
+    req: ConversationRenameRequest,
+    request: Request,
+):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(req.browser_id)
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required.")
+    if len(title) > 200:
+        raise HTTPException(status_code=400, detail="Title is too long.")
+
+    row = update_conversation_title(conversation_id, owner_key, title)
+    if not row:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return {
+        "conversation_id": str(row["id"]),
+        "title": row["title"],
     }
 
 
@@ -394,11 +608,23 @@ def chat(req: ChatRequest, request: Request):
         state.setdefault("ram_wizard", {"active": False, "step": "machine"})
         state.setdefault("intent", "qa")
 
+        artifact_context_info = _build_artifact_context_for_conversation(conversation_id)
+        state["artifact_context"] = artifact_context_info.get("artifact_context", "")
+        state["artifact_meta"] = {
+            "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
+            "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+            "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
+        }
+
         user_msg_row = insert_message(
             conversation_id=conversation_id,
             role="user",
             content=req.message,
             speaker="USER",
+            metadata={
+                "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
+                "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+            },
         )
 
         state["messages"] = state.get("messages", []) + [
@@ -409,7 +635,12 @@ def chat(req: ChatRequest, request: Request):
             conversation_id=conversation_id,
             message_id=str(user_msg_row["id"]),
             run_type="chat_turn",
-            input_json={"message": req.message},
+            input_json={
+                "message": req.message,
+                "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
+                "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+                "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
+            },
         )
 
         out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})
@@ -438,6 +669,11 @@ def chat(req: ChatRequest, request: Request):
             role="assistant",
             content=assistant_text,
             speaker=assistant_speaker,
+            metadata={
+                "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
+                "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+                "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
+            },
         )
 
         title = conv.get("title") if conv else None
@@ -454,7 +690,11 @@ def chat(req: ChatRequest, request: Request):
         finish_agent_run(
             run_id=str(run["id"]),
             status="completed",
-            result_json={"reply_preview": assistant_text[:200]},
+            result_json={
+                "reply_preview": assistant_text[:200],
+                "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
+                "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+            },
         )
 
         return ChatResponse(

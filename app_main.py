@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -23,18 +23,22 @@ from db import (
     update_conversation_after_turn,
     create_agent_run,
     finish_agent_run,
+    insert_agent_output,
+    list_artifacts,
+    get_artifact,
+    delete_artifact,
+    delete_conversation,
+    list_artifact_storage_keys_for_conversation,
 )
 
 # Load .env
 load_dotenv()
 
-# Import your graph
 from agent.graph import get_graph  # noqa: E402
 
 
 app = FastAPI(title="AI-Squared Backend", version="0.1.0")
 
-# Allow frontend origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -47,11 +51,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory cache for active sessions
-# Neon is the source of truth; this just speeds up active conversations
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-# Build graph once
 GRAPH = get_graph()
 
 UPLOAD_DIR = Path("uploads")
@@ -64,8 +64,8 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
-    session_id: Optional[str] = None  # backward compatibility
-    browser_id: Optional[str] = None  # will be used by frontend sidebar/history
+    session_id: Optional[str] = None
+    browser_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -95,8 +95,6 @@ def _is_production() -> bool:
 
 
 def _cookie_domain() -> Optional[str]:
-    # For local dev, return None
-    # For production, use the shared parent domain so app.ai-squared.net can use api.ai-squared.net session flow
     return ".ai-squared.net" if _is_production() else None
 
 
@@ -158,15 +156,21 @@ def _require_auth(request: Request) -> None:
 
 
 def _resolve_owner_key(browser_id: Optional[str]) -> str:
-    """
-    Temporary owner-key strategy until full user accounts are added.
-    Once the frontend sends a stable browser_id, each browser gets its own chat list.
-    For backward compatibility right now, fall back to a shared key.
-    """
     browser_id = (browser_id or "").strip()
     if browser_id:
         return browser_id
     return "shared-login-user"
+
+
+def _safe_unlink(path_str: Optional[str]) -> None:
+    if not path_str:
+        return
+    try:
+        path = Path(path_str)
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -283,6 +287,81 @@ def api_get_conversation(conversation_id: str, request: Request, browser_id: Opt
     )
 
 
+@app.get("/api/conversations/{conversation_id}/artifacts")
+def api_list_artifacts(conversation_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    conv = get_conversation(conversation_id, owner_key)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    rows = list_artifacts(conversation_id)
+    return {
+        "items": [
+            {
+                "id": str(r["id"]),
+                "conversation_id": str(r["conversation_id"]),
+                "run_id": str(r["run_id"]) if r.get("run_id") else None,
+                "output_type": r.get("output_type"),
+                "title": r.get("title"),
+                "storage_provider": r.get("storage_provider"),
+                "storage_key": r.get("storage_key"),
+                "mime_type": r.get("mime_type"),
+                "metadata": r.get("metadata") or {},
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def api_delete_conversation(conversation_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    conv = get_conversation(conversation_id, owner_key)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    storage_keys = list_artifact_storage_keys_for_conversation(conversation_id, owner_key)
+
+    deleted = delete_conversation(conversation_id, owner_key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    if conversation_id in SESSIONS:
+        del SESSIONS[conversation_id]
+
+    for key in storage_keys:
+        _safe_unlink(key)
+
+    return {"ok": True, "conversation_id": conversation_id}
+
+
+@app.delete("/api/artifacts/{artifact_id}")
+def api_delete_artifact(artifact_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    artifact = get_artifact(artifact_id, owner_key)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+
+    storage_key = artifact.get("storage_key")
+    storage_provider = artifact.get("storage_provider")
+
+    deleted = delete_artifact(artifact_id, owner_key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+
+    if storage_provider == "local":
+        _safe_unlink(storage_key)
+
+    return {"ok": True, "artifact_id": artifact_id}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, request: Request):
     _require_auth(request)
@@ -290,22 +369,18 @@ def chat(req: ChatRequest, request: Request):
     try:
         owner_key = _resolve_owner_key(req.browser_id)
 
-        # Backward compatibility: accept old session_id from current frontend
         conversation_id = req.conversation_id or req.session_id
         conv = None
 
         if conversation_id:
             conv = get_conversation(conversation_id, owner_key)
             if not conv:
-                # If the frontend still sends an old in-memory session id that isn't in Neon yet,
-                # create a fresh conversation so chat still works instead of hard failing.
                 conv = create_conversation(owner_key)
                 conversation_id = str(conv["id"])
         else:
             conv = create_conversation(owner_key)
             conversation_id = str(conv["id"])
 
-        # Load from active in-memory cache first; otherwise from Neon last_state
         state = SESSIONS.get(conversation_id)
         if state is None:
             saved_state = conv.get("last_state") if conv else {}
@@ -315,12 +390,10 @@ def chat(req: ChatRequest, request: Request):
                 "intent": "qa",
             }
 
-        # Ensure base state keys exist
         state.setdefault("messages", [])
         state.setdefault("ram_wizard", {"active": False, "step": "machine"})
         state.setdefault("intent", "qa")
 
-        # Save user message to DB
         user_msg_row = insert_message(
             conversation_id=conversation_id,
             role="user",
@@ -328,7 +401,6 @@ def chat(req: ChatRequest, request: Request):
             speaker="USER",
         )
 
-        # Add user message to working state
         state["messages"] = state.get("messages", []) + [
             {"role": "user", "content": req.message}
         ]
@@ -400,23 +472,67 @@ def chat(req: ChatRequest, request: Request):
 
 
 @app.post("/api/upload")
-async def upload_file(request: Request, file: UploadFile = File(...)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    browser_id: Optional[str] = Form(None),
+):
     _require_auth(request)
 
     try:
-        suffix = Path(file.filename).suffix
+        owner_key = _resolve_owner_key(browser_id)
+
+        conv = None
+        if conversation_id:
+            conv = get_conversation(conversation_id, owner_key)
+            if not conv:
+                raise HTTPException(status_code=404, detail="Conversation not found.")
+        else:
+            conv = create_conversation(owner_key, title=file.filename)
+            conversation_id = str(conv["id"])
+
+        suffix = Path(file.filename or "").suffix
         safe_name = f"{uuid.uuid4().hex}{suffix}"
         out_path = UPLOAD_DIR / safe_name
 
         content = await file.read()
         out_path.write_bytes(content)
 
+        artifact = insert_agent_output(
+            conversation_id=conversation_id,
+            run_id=None,
+            output_type="uploaded_file",
+            title=file.filename,
+            storage_provider="local",
+            storage_key=str(out_path.resolve()),
+            mime_type=file.content_type,
+            metadata={
+                "original_filename": file.filename,
+                "stored_as": safe_name,
+                "size_bytes": len(content),
+            },
+        )
+
+        update_conversation_after_turn(
+            conversation_id=conversation_id,
+            last_message_preview=f"Uploaded: {file.filename}",
+            last_state=(conv.get("last_state") if conv else {}) or {},
+            title=(conv.get("title") if conv and conv.get("title") else file.filename),
+        )
+
         return {
             "ok": True,
+            "conversation_id": conversation_id,
+            "artifact_id": str(artifact["id"]),
             "filename": file.filename,
             "stored_as": safe_name,
             "server_path": str(out_path.resolve()),
+            "mime_type": file.content_type,
+            "metadata": artifact.get("metadata") or {},
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 

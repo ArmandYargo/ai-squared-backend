@@ -174,3 +174,123 @@ def finish_agent_run(run_id: str, status: str, result_json=None, error_json=None
             (status, Jsonb(result_json or {}), Jsonb(error_json or {}), run_id),
         )
         conn.commit()
+
+
+def insert_agent_output(
+    conversation_id: str,
+    output_type: str,
+    title: Optional[str] = None,
+    run_id: Optional[str] = None,
+    storage_provider: Optional[str] = None,
+    storage_key: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO app.agent_outputs
+                (conversation_id, run_id, output_type, title, storage_provider, storage_key, mime_type, metadata)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                conversation_id,
+                run_id,
+                output_type,
+                title,
+                storage_provider,
+                storage_key,
+                mime_type,
+                Jsonb(metadata or {}),
+            ),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row
+
+
+def list_artifacts(conversation_id: str) -> List[Dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM app.agent_outputs
+            WHERE conversation_id = %s
+            ORDER BY created_at DESC
+            """,
+            (conversation_id,),
+        )
+        return cur.fetchall()
+
+
+def get_artifact(artifact_id: str, owner_key: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ao.*, c.owner_key
+            FROM app.agent_outputs ao
+            JOIN app.conversations c
+              ON c.id = ao.conversation_id
+            WHERE ao.id = %s
+              AND c.owner_key = %s
+              AND c.archived_at IS NULL
+            """,
+            (artifact_id, owner_key),
+        )
+        return cur.fetchone()
+
+
+def delete_artifact(artifact_id: str, owner_key: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM app.agent_outputs ao
+            USING app.conversations c
+            WHERE ao.conversation_id = c.id
+              AND ao.id = %s
+              AND c.owner_key = %s
+            RETURNING ao.*
+            """,
+            (artifact_id, owner_key),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row
+
+
+def delete_conversation(conversation_id: str, owner_key: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM app.conversations
+            WHERE id = %s AND owner_key = %s
+            RETURNING *
+            """,
+            (conversation_id, owner_key),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row
+
+
+def list_artifact_storage_keys_for_conversation(
+    conversation_id: str, owner_key: str
+) -> List[str]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ao.storage_key
+            FROM app.agent_outputs ao
+            JOIN app.conversations c
+              ON c.id = ao.conversation_id
+            WHERE ao.conversation_id = %s
+              AND c.owner_key = %s
+              AND ao.storage_provider = 'local'
+              AND ao.storage_key IS NOT NULL
+            """,
+            (conversation_id, owner_key),
+        )
+        rows = cur.fetchall()
+        return [r["storage_key"] for r in rows if r.get("storage_key")]

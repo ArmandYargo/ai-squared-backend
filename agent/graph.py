@@ -187,6 +187,86 @@ def node_qa(state: AgentState) -> AgentState:
     used_titles = artifact_meta.get("used_artifact_titles") or []
     skipped_artifacts = artifact_meta.get("skipped_artifacts") or []
 
+    print(f"[node_qa] used_titles={used_titles}", flush=True)
+    print(f"[node_qa] skipped_artifacts={skipped_artifacts}", flush=True)
+    print(f"[node_qa] artifact_context_length={len(artifact_context)}", flush=True)
+
+    q_lower = question.lower()
+
+    asks_about_artifacts = any(
+        phrase in q_lower
+        for phrase in [
+            "what uploaded artifacts",
+            "what artifacts",
+            "what documents",
+            "what files",
+            "what attachments",
+            "uploaded artifacts do you have access to",
+        ]
+    )
+
+    asks_for_summary = any(
+        phrase in q_lower
+        for phrase in [
+            "summarise",
+            "summarize",
+            "summary",
+            "summarise this document",
+            "summarize this document",
+        ]
+    )
+
+    if asks_about_artifacts:
+        if used_titles:
+            reply = "I have access to these uploaded artifacts in this conversation:\n" + "\n".join(
+                f"- {title}" for title in used_titles
+            )
+            if skipped_artifacts:
+                reply += "\n\nSome uploaded artifacts were found but were not usable for text extraction:\n"
+                reply += "\n".join(
+                    f"- {item.get('title') or 'Untitled'}: {item.get('reason') or 'Skipped'}"
+                    for item in skipped_artifacts
+                )
+        elif skipped_artifacts:
+            reply = "I found uploaded artifacts in this conversation, but they were not usable for text extraction:\n"
+            reply += "\n".join(
+                f"- {item.get('title') or 'Untitled'}: {item.get('reason') or 'Skipped'}"
+                for item in skipped_artifacts
+            )
+        else:
+            reply = (
+                "I do not currently have any usable uploaded artifact text in this conversation. "
+                "That usually means no files are attached to this chat yet, or extraction failed."
+            )
+
+        state.setdefault("messages", []).append(
+            {"role": "assistant", "content": reply, "speaker": "LLM"}
+        )
+        return state
+
+    if asks_for_summary and not artifact_context:
+        if skipped_artifacts:
+            reply = (
+                "I found uploaded artifact(s), but I could not extract usable text from them.\n\n"
+                "Extraction results:\n"
+                + "\n".join(
+                    f"- {item.get('title') or 'Untitled'}: {item.get('reason') or 'Skipped'}"
+                    for item in skipped_artifacts
+                )
+                + "\n\nThis usually means the PDF is scanned/image-based, the extraction library is missing, "
+                  "or the file type is not yet supported."
+            )
+        else:
+            reply = (
+                "I don’t have any extracted document text available in this conversation yet. "
+                "The file may not have been attached to this chat, or no usable text was extracted."
+            )
+
+        state.setdefault("messages", []).append(
+            {"role": "assistant", "content": reply, "speaker": "LLM"}
+        )
+        return state
+
     system_prompt = (
         "You are a helpful engineering and document-analysis assistant.\n"
         "If document context is provided, answer using that material first.\n"
@@ -201,7 +281,7 @@ def node_qa(state: AgentState) -> AgentState:
     if artifact_context:
         user_parts.append(
             "The following extracted document context comes from uploaded artifacts in this conversation.\n"
-            "Use it to answer the user's question.\n\n"
+            "Use it as the primary source for the answer.\n\n"
             f"{artifact_context}"
         )
 

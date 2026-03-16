@@ -17,16 +17,10 @@ except Exception:
 
 from agent.state import AgentState
 from agent.ram_tool import run_ram_pipeline_compat, check_ram_readiness
-
-# category helpers live in ram_module funcs (already in sys.path via ram_tool.py)
 from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
-
 from agent.ram_simulation_tool import run_ram_simulation_archived
 
 
-# -------------------------
-# OpenAI helper
-# -------------------------
 def _llm_text(messages: List[Dict[str, str]]) -> str:
     from openai import OpenAI
 
@@ -50,9 +44,6 @@ def _is_greeting(text: str) -> bool:
     return t in {"hi", "hello", "hey", "howzit", "morning", "good morning", "good afternoon", "good evening"}
 
 
-# -------------------------
-# AI Router helper
-# -------------------------
 _ALLOWED_INTENTS = ("qa", "ram_wizard")
 
 
@@ -93,7 +84,7 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
         "Rules:\n"
         "- If the user asks a question about regulations/laws/definitions/concepts, choose qa.\n"
         "- If the user asks about an uploaded file, document, summary, comparison, or attached material, choose qa.\n"
-        "- If the user is supplying a requested field (machine name, date range, file path) while wizard is active, choose ram_wizard.\n"
+        "- If the user is supplying a requested field while wizard is active, choose ram_wizard.\n"
         "- If unclear, prefer qa.\n\n"
         "Output MUST be valid JSON with keys: intent, confidence, reason."
     )
@@ -110,9 +101,6 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
     return {}
 
 
-# -------------------------
-# Router node
-# -------------------------
 def node_router(state: AgentState) -> AgentState:
     msgs = state.get("messages") or []
     if not msgs:
@@ -123,7 +111,6 @@ def node_router(state: AgentState) -> AgentState:
     wiz_active = state.get("ram_wizard", {}).get("active") is True
     t = (user_text or "").strip()
 
-    # Explicit QA shortcuts
     if t.startswith("?") or t.lower().startswith("/ask "):
         state["intent"] = "qa"
         if t.startswith("?"):
@@ -132,7 +119,6 @@ def node_router(state: AgentState) -> AgentState:
             state["messages"][-1]["content"] = t[5:].strip()
         return state
 
-    # RAM commands
     if t.lower().startswith("/ram"):
         parts = t.split(maxsplit=1)
         cmd = parts[1].strip().lower() if len(parts) > 1 else ""
@@ -140,12 +126,10 @@ def node_router(state: AgentState) -> AgentState:
         state["intent"] = "ram_wizard"
         return state
 
-    # Wizard active: keep flow, allow questions
     if wiz_active:
         state["intent"] = "qa" if _looks_like_question(t) or _is_greeting(t) else "ram_wizard"
         return state
 
-    # Wizard inactive: ask the LLM to decide
     try:
         route = _route_intent_ai(t, wiz_active=False)
     except Exception:
@@ -160,9 +144,6 @@ def node_router(state: AgentState) -> AgentState:
     return state
 
 
-# -------------------------
-# QA node
-# -------------------------
 def node_qa(state: AgentState) -> AgentState:
     print("[node_qa] entered", flush=True)
 
@@ -317,9 +298,6 @@ def node_qa(state: AgentState) -> AgentState:
     return state
 
 
-# -------------------------
-# RAM Wizard + Simulation
-# -------------------------
 def _wizard_reply(state: AgentState, text: str) -> None:
     state.setdefault("messages", []).append({"role": "assistant", "content": text, "speaker": "WIZARD"})
 
@@ -339,10 +317,6 @@ def _default_dates_from_input_sheet(xlsx_path: str):
 
 
 def _pick_excel_file_dialog() -> Optional[str]:
-    """
-    Try to open a native file picker dialog (Windows/macOS/Linux).
-    Returns a selected file path, or None if cancelled/unavailable.
-    """
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -412,11 +386,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     wiz.setdefault("date_range_text", None)
     wiz.setdefault("excel_path", None)
 
-    # categories state
     wiz.setdefault("categories", None)
     wiz.setdefault("categories_last_ai", None)
 
-    # readiness gate state
     wiz.setdefault("readiness_payload", None)
 
     wiz.setdefault("ram_input_path", None)
@@ -425,7 +397,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     wiz.setdefault("simulations", None)
     wiz.setdefault("sim_archive_dir", None)
 
-    # ---------- RAM commands ----------
     cmd = (state.get("ram_command") or "").strip().lower()
     if cmd:
         state["ram_command"] = ""
@@ -455,17 +426,15 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(state, "Unknown /ram command. Use: /ram status | /ram reset | /ram cancel")
         return state
 
-    # ---------- start wizard ----------
+    user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
+    user_text_stripped = user_text.strip()
+
     if not wiz.get("active"):
         wiz["active"] = True
         wiz["step"] = "machine"
         _wizard_reply(state, "RAM Input Sheet Wizard started.\nWhat machine are we working on? (e.g., 'Conveyor CV-101')")
         return state
 
-    user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
-    user_text_stripped = user_text.strip()
-
-    # ---------- machine ----------
     if wiz["step"] == "machine":
         if not user_text_stripped:
             _wizard_reply(state, "Please enter the machine name/type.")
@@ -475,7 +444,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(state, "Optional: enter a date range (e.g., '2019-01-01 to 2021-12-31' or '2023-2024') or type 'skip'.")
         return state
 
-    # ---------- date ----------
     if wiz["step"] == "date":
         if not user_text_stripped:
             _wizard_reply(state, "Enter a date range or type 'skip'.")
@@ -485,7 +453,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(state, "Please provide the path to the CMMS Excel file, or type 'pick file'.")
         return state
 
-    # ---------- file ----------
     if wiz["step"] == "file":
         if not user_text_stripped:
             _wizard_reply(state, "Please provide an Excel file path, or type 'pick file'.")
@@ -526,7 +493,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "readiness_confirm"
         return state
 
-    # ---------- readiness confirm ----------
     if wiz["step"] == "readiness_confirm":
         t = user_text_stripped.lower()
 
@@ -563,7 +529,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         return state
 
-    # ---------- categories edit: ENTER accepts, otherwise edit ----------
     if wiz["step"] == "categories_edit":
         if user_text == "":
             wiz["step"] = "confirm_create"
@@ -599,7 +564,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "categories_confirm_or_edit"
         return state
 
-    # ---------- categories confirm: Y continues, N prompts for edit; other = treat as edit ----------
     if wiz["step"] == "categories_confirm_or_edit":
         t = user_text_stripped.lower()
 
@@ -645,7 +609,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         return state
 
-    # ---------- confirm create ----------
     if wiz["step"] == "confirm_create":
         ans = user_text_stripped.lower()
         if ans in {"no", "n", "cancel"}:
@@ -692,7 +655,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(state, "Do you want to proceed to simulate the RAM model now? (yes/no)")
         return state
 
-    # ---------- sim confirm ----------
     if wiz["step"] == "sim_confirm":
         ans = user_text_stripped.lower()
         if ans in {"no", "n"}:
@@ -715,7 +677,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "sim_start"
         return state
 
-    # ---------- sim start ----------
     if wiz["step"] == "sim_start":
         t = user_text_stripped
         if t.lower() == "default" and wiz.get("_sim_default_start"):
@@ -734,7 +695,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "sim_end"
         return state
 
-    # ---------- sim end ----------
     if wiz["step"] == "sim_end":
         t = user_text_stripped
         if t.lower() == "default" and wiz.get("_sim_default_end"):
@@ -750,7 +710,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "sim_sims"
         return state
 
-    # ---------- sim sims ----------
     if wiz["step"] == "sim_sims":
         t = user_text_stripped or "200"
         try:
@@ -764,7 +723,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "sim_run"
         _wizard_reply(state, "Running simulation + archiving results...")
 
-    # ---------- sim run ----------
     if wiz["step"] == "sim_run":
         try:
             start = _parse_date_yyyy_mm_dd(wiz.get("sim_start"))
@@ -807,9 +765,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     return state
 
 
-# -------------------------
-# Graph build
-# -------------------------
 def get_graph():
     builder = StateGraph(AgentState)
     builder.add_node("router", node_router)

@@ -32,7 +32,6 @@ from db import (
     update_conversation_title,
 )
 
-# Load .env
 load_dotenv()
 
 from agent.graph import get_graph  # noqa: E402
@@ -59,7 +58,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 COOKIE_NAME = "ai_squared_session"
-COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 
 MAX_TEXT_PER_ARTIFACT = 18000
 MAX_TOTAL_ARTIFACT_CONTEXT = 45000
@@ -594,6 +593,11 @@ def chat(req: ChatRequest, request: Request):
         else:
             conv = create_conversation(owner_key)
             conversation_id = str(conv["id"])
+
+        rows_for_debug = list_artifacts(conversation_id)
+        print(f"[chat] conversation_id={conversation_id}", flush=True)
+        print(f"[chat] artifact_count={len(rows_for_debug)}", flush=True)
+        print(f"[chat] artifact_titles={[r.get('title') for r in rows_for_debug]}", flush=True)
 
         state = SESSIONS.get(conversation_id)
         if state is None:

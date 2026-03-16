@@ -4,6 +4,7 @@ import re
 import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -21,6 +22,9 @@ from func_define_components import ai_propose_components_coarse, ai_apply_edit_t
 from agent.ram_simulation_tool import run_ram_simulation_archived
 
 
+# -------------------------
+# OpenAI helper
+# -------------------------
 def _llm_text(messages: List[Dict[str, str]]) -> str:
     from openai import OpenAI
 
@@ -41,9 +45,58 @@ def _llm_text(messages: List[Dict[str, str]]) -> str:
 
 def _is_greeting(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"hi", "hello", "hey", "howzit", "morning", "good morning", "good afternoon", "good evening"}
+    return t in {
+        "hi", "hello", "hey", "howzit", "morning",
+        "good morning", "good afternoon", "good evening"
+    }
 
 
+# -------------------------
+# Artifact helpers
+# -------------------------
+def _excel_suffixes() -> set[str]:
+    return {".xlsx", ".xlsm", ".xls"}
+
+
+def _is_excel_artifact(artifact: Dict[str, Any]) -> bool:
+    title = (artifact.get("title") or "").lower()
+    mime = (artifact.get("mime_type") or "").lower()
+    suffix = Path(title).suffix.lower()
+
+    if suffix in _excel_suffixes():
+        return True
+
+    return mime in {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-excel.sheet.macroenabled.12",
+    }
+
+
+def _latest_excel_artifact(state: AgentState) -> Optional[Dict[str, Any]]:
+    artifacts = state.get("conversation_artifacts") or []
+    excel_artifacts = [a for a in artifacts if _is_excel_artifact(a)]
+    if not excel_artifacts:
+        return None
+    return excel_artifacts[0]
+
+
+def _artifact_prompt_hint(state: AgentState) -> str:
+    latest = _latest_excel_artifact(state)
+    if not latest:
+        return (
+            "Please upload the CMMS Excel workbook into this conversation, then say "
+            "'use uploaded file' or continue the wizard."
+        )
+    return (
+        f"I found an uploaded workbook in this conversation: {latest.get('title')}\n"
+        "Reply with 'use uploaded file' to use it, or paste a different path if needed."
+    )
+
+
+# -------------------------
+# AI Router helper
+# -------------------------
 _ALLOWED_INTENTS = ("qa", "ram_wizard")
 
 
@@ -73,6 +126,21 @@ def _looks_like_question(text: str) -> bool:
     )
 
 
+def _looks_like_ram_start(text: str) -> bool:
+    t = (text or "").strip().lower()
+    phrases = [
+        "create input sheet",
+        "build input sheet",
+        "start ram",
+        "ram wizard",
+        "run ram",
+        "start simulation",
+        "simulate ram",
+        "run simulation",
+    ]
+    return any(p in t for p in phrases)
+
+
 def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
     system = (
         "You are an intent router for a reliability engineering assistant for mines/factories.\n"
@@ -82,9 +150,10 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
         "- ram_wizard: user wants to create/continue the RAM input sheet workflow, provide required wizard input, "
         "or proceed with simulation steps.\n\n"
         "Rules:\n"
-        "- If the user asks a question about regulations/laws/definitions/concepts, choose qa.\n"
         "- If the user asks about an uploaded file, document, summary, comparison, or attached material, choose qa.\n"
-        "- If the user is supplying a requested field while wizard is active, choose ram_wizard.\n"
+        "- If the user wants to build an input sheet, run RAM, use an uploaded workbook, continue a wizard, "
+        "or start simulation, choose ram_wizard.\n"
+        "- If the user is supplying machine/date/file/category/simulation values while wizard is active, choose ram_wizard.\n"
         "- If unclear, prefer qa.\n\n"
         "Output MUST be valid JSON with keys: intent, confidence, reason."
     )
@@ -101,6 +170,9 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
     return {}
 
 
+# -------------------------
+# Router node
+# -------------------------
 def node_router(state: AgentState) -> AgentState:
     msgs = state.get("messages") or []
     if not msgs:
@@ -126,6 +198,10 @@ def node_router(state: AgentState) -> AgentState:
         state["intent"] = "ram_wizard"
         return state
 
+    if _looks_like_ram_start(t):
+        state["intent"] = "ram_wizard"
+        return state
+
     if wiz_active:
         state["intent"] = "qa" if _looks_like_question(t) or _is_greeting(t) else "ram_wizard"
         return state
@@ -137,13 +213,19 @@ def node_router(state: AgentState) -> AgentState:
 
     if route:
         state["intent"] = route["intent"]
-        state["route_meta"] = {"confidence": route.get("confidence"), "reason": route.get("reason")}
+        state["route_meta"] = {
+            "confidence": route.get("confidence"),
+            "reason": route.get("reason"),
+        }
         return state
 
     state["intent"] = "qa"
     return state
 
 
+# -------------------------
+# QA node
+# -------------------------
 def node_qa(state: AgentState) -> AgentState:
     print("[node_qa] entered", flush=True)
 
@@ -298,6 +380,9 @@ def node_qa(state: AgentState) -> AgentState:
     return state
 
 
+# -------------------------
+# RAM Wizard + Simulation
+# -------------------------
 def _wizard_reply(state: AgentState, text: str) -> None:
     state.setdefault("messages", []).append({"role": "assistant", "content": text, "speaker": "WIZARD"})
 
@@ -372,7 +457,7 @@ def _format_readiness_summary(readiness_payload: Dict[str, Any]) -> str:
 def _format_numbered_categories(cats: List[str]) -> str:
     if not cats:
         return "(no categories)"
-    return "\n".join([f"{i+1}. {c}" for i, c in enumerate(cats)])
+    return "\n".join([f"{i + 1}. {c}" for i, c in enumerate(cats)])
 
 
 def node_ram_wizard(state: AgentState) -> AgentState:
@@ -385,17 +470,22 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     wiz.setdefault("machine", None)
     wiz.setdefault("date_range_text", None)
     wiz.setdefault("excel_path", None)
+    wiz.setdefault("source_artifact_id", None)
+    wiz.setdefault("source_artifact_title", None)
 
     wiz.setdefault("categories", None)
     wiz.setdefault("categories_last_ai", None)
-
     wiz.setdefault("readiness_payload", None)
 
     wiz.setdefault("ram_input_path", None)
+    wiz.setdefault("classified_path", None)
     wiz.setdefault("sim_start", None)
     wiz.setdefault("sim_end", None)
     wiz.setdefault("simulations", None)
     wiz.setdefault("sim_archive_dir", None)
+    wiz.setdefault("sim_metadata_path", None)
+    wiz.setdefault("sim_outputs", None)
+    wiz.setdefault("sim_conditions", None)
 
     cmd = (state.get("ram_command") or "").strip().lower()
     if cmd:
@@ -409,7 +499,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 f"- machine: {wiz.get('machine')}\n"
                 f"- date_range_text: {wiz.get('date_range_text')}\n"
                 f"- excel_path: {wiz.get('excel_path')}\n"
+                f"- source_artifact_title: {wiz.get('source_artifact_title')}\n"
                 f"- ram_input_path: {wiz.get('ram_input_path')}\n"
+                f"- classified_path: {wiz.get('classified_path')}\n"
                 f"- sim_start: {wiz.get('sim_start')}\n"
                 f"- sim_end: {wiz.get('sim_end')}\n"
                 f"- simulations: {wiz.get('simulations')}\n"
@@ -423,17 +515,57 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "RAM wizard cancelled/reset. You can start again by typing: create input sheet")
             return state
 
+        if cmd in {"use uploaded", "use uploaded file", "use latest upload"}:
+            latest = _latest_excel_artifact(state)
+            if not latest:
+                _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
+                return state
+            wiz["excel_path"] = latest.get("storage_key")
+            wiz["source_artifact_id"] = latest.get("id")
+            wiz["source_artifact_title"] = latest.get("title")
+            wiz["step"] = "readiness_confirm"
+            _wizard_reply(state, f"Using uploaded workbook: {wiz['source_artifact_title']}\nRunning data readiness check...")
+            try:
+                payload = check_ram_readiness(
+                    excel_path=wiz["excel_path"],
+                    machine=wiz["machine"],
+                )
+                wiz["readiness_payload"] = payload
+                _wizard_reply(
+                    state,
+                    _format_readiness_summary(payload)
+                    + "\n\nProceed with this file?\n"
+                      "- yes (continue)\n"
+                      "- use uploaded file (reselect latest upload)\n"
+                      "- cancel (stop wizard)"
+                )
+            except Exception as e:
+                wiz["step"] = "file"
+                _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}")
+            return state
+
         _wizard_reply(state, "Unknown /ram command. Use: /ram status | /ram reset | /ram cancel")
         return state
-
-    user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
-    user_text_stripped = user_text.strip()
 
     if not wiz.get("active"):
         wiz["active"] = True
         wiz["step"] = "machine"
-        _wizard_reply(state, "RAM Input Sheet Wizard started.\nWhat machine are we working on? (e.g., 'Conveyor CV-101')")
+        latest = _latest_excel_artifact(state)
+        extra = (
+            f"\nI can already see an uploaded workbook: {latest.get('title')}"
+            if latest else ""
+        )
+        _wizard_reply(
+            state,
+            "RAM Input Sheet Wizard started.\n"
+            "What machine are we working on? (e.g., 'Conveyor CV-101')"
+            f"{extra}"
+        )
         return state
+
+    user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
+    user_text_stripped = user_text.strip()
+    user_lower = user_text_stripped.lower()
 
     if wiz["step"] == "machine":
         if not user_text_stripped:
@@ -441,43 +573,64 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
         wiz["machine"] = user_text_stripped
         wiz["step"] = "date"
-        _wizard_reply(state, "Optional: enter a date range (e.g., '2019-01-01 to 2021-12-31' or '2023-2024') or type 'skip'.")
+        _wizard_reply(
+            state,
+            "Optional: enter a date range (e.g., '2019-01-01 to 2021-12-31' or '2023-2024') or type 'skip'."
+        )
         return state
 
     if wiz["step"] == "date":
         if not user_text_stripped:
             _wizard_reply(state, "Enter a date range or type 'skip'.")
             return state
-        wiz["date_range_text"] = None if user_text_stripped.lower() in {"skip", "none", "no"} else user_text_stripped
+        wiz["date_range_text"] = None if user_lower in {"skip", "none", "no"} else user_text_stripped
         wiz["step"] = "file"
-        _wizard_reply(state, "Please provide the path to the CMMS Excel file, or type 'pick file'.")
+        _wizard_reply(state, _artifact_prompt_hint(state))
         return state
 
     if wiz["step"] == "file":
-        if not user_text_stripped:
-            _wizard_reply(state, "Please provide an Excel file path, or type 'pick file'.")
-            return state
+        latest = _latest_excel_artifact(state)
 
-        if user_text_stripped.lower() in {"pick file", "pick", "browse", "choose file", "select file"}:
+        if user_lower in {"use uploaded file", "use uploaded", "use latest upload", "use latest file"}:
+            if not latest:
+                _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
+                return state
+            wiz["excel_path"] = latest.get("storage_key")
+            wiz["source_artifact_id"] = latest.get("id")
+            wiz["source_artifact_title"] = latest.get("title")
+        elif user_lower in {"pick file", "pick", "browse", "choose file", "select file"}:
             picked = _pick_excel_file_dialog()
             if not picked:
                 _wizard_reply(
                     state,
-                    "No file selected (cancelled). Please provide a path, or type 'pick file' again."
+                    f"No file selected (cancelled). {_artifact_prompt_hint(state)}"
                 )
                 return state
             wiz["excel_path"] = picked
-        else:
+            wiz["source_artifact_id"] = None
+            wiz["source_artifact_title"] = Path(picked).name
+        elif user_text_stripped:
             wiz["excel_path"] = user_text_stripped
+            wiz["source_artifact_id"] = None
+            wiz["source_artifact_title"] = Path(user_text_stripped).name
+        else:
+            _wizard_reply(state, _artifact_prompt_hint(state))
+            return state
 
-        _wizard_reply(state, f"Selected file:\n{wiz['excel_path']}\n\nRunning data readiness check...")
+        _wizard_reply(
+            state,
+            f"Selected file:\n{wiz['source_artifact_title'] or wiz['excel_path']}\n\nRunning data readiness check..."
+        )
         try:
             payload = check_ram_readiness(
                 excel_path=wiz["excel_path"],
                 machine=wiz["machine"],
             )
         except Exception as e:
-            _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\nType 'pick file' to select another file or paste a new path.")
+            _wizard_reply(
+                state,
+                f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}"
+            )
             wiz["step"] = "file"
             return state
 
@@ -487,20 +640,25 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _format_readiness_summary(payload)
             + "\n\nProceed with this file?\n"
               "- yes (continue)\n"
-              "- pick file (choose another file)\n"
+              "- use uploaded file (choose latest uploaded workbook)\n"
               "- cancel (stop wizard)"
         )
         wiz["step"] = "readiness_confirm"
         return state
 
     if wiz["step"] == "readiness_confirm":
-        t = user_text_stripped.lower()
+        t = user_lower
 
-        if t in {"pick file", "pick", "pick new file", "new file", "choose file", "browse"}:
-            wiz["excel_path"] = None
-            wiz["readiness_payload"] = None
+        if t in {"use uploaded file", "use uploaded", "use latest upload", "use latest file"}:
+            latest = _latest_excel_artifact(state)
+            if not latest:
+                _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
+                return state
+            wiz["excel_path"] = latest.get("storage_key")
+            wiz["source_artifact_id"] = latest.get("id")
+            wiz["source_artifact_title"] = latest.get("title")
             wiz["step"] = "file"
-            _wizard_reply(state, "Okay — select a new CMMS Excel file (type 'pick file' or paste the path).")
+            _wizard_reply(state, f"Okay — switching to uploaded workbook: {wiz['source_artifact_title']}")
             return state
 
         if t in {"cancel", "no", "n"}:
@@ -509,7 +667,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         if t not in {"yes", "y"}:
-            _wizard_reply(state, "Please respond with: yes | pick file | cancel")
+            _wizard_reply(state, "Please respond with: yes | use uploaded file | cancel")
             return state
 
         wiz["step"] = "categories_edit"
@@ -535,7 +693,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Categories accepted.\n\nReady to create the RAM input sheet. Type 'yes' to proceed or 'no' to cancel.")
             return state
 
-        if user_text_stripped.lower() == "reset":
+        if user_lower == "reset":
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
             cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
             wiz["categories"] = cats
@@ -550,7 +708,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
         model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
         try:
-            wiz["categories"] = ai_apply_edit_to_components(wiz.get("categories") or [], user_text_stripped, model=model)
+            wiz["categories"] = ai_apply_edit_to_components(
+                wiz.get("categories") or [], user_text_stripped, model=model
+            )
         except Exception as e:
             _wizard_reply(state, f"Edit failed: {type(e).__name__}: {e}\nTry a simpler edit (e.g., 'remove idler').")
             return state
@@ -565,7 +725,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         return state
 
     if wiz["step"] == "categories_confirm_or_edit":
-        t = user_text_stripped.lower()
+        t = user_lower
 
         if t in {"y", "yes"}:
             wiz["step"] = "confirm_create"
@@ -596,7 +756,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
         model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
         try:
-            wiz["categories"] = ai_apply_edit_to_components(wiz.get("categories") or [], user_text_stripped, model=model)
+            wiz["categories"] = ai_apply_edit_to_components(
+                wiz.get("categories") or [], user_text_stripped, model=model
+            )
         except Exception as e:
             _wizard_reply(state, f"Edit failed: {type(e).__name__}: {e}\nTry a simpler edit (e.g., 'remove idler').")
             return state
@@ -610,7 +772,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         return state
 
     if wiz["step"] == "confirm_create":
-        ans = user_text_stripped.lower()
+        ans = user_lower
         if ans in {"no", "n", "cancel"}:
             state["ram_wizard"] = {"active": False, "step": "machine"}
             _wizard_reply(state, "Cancelled. Type 'create input sheet' to start again.")
@@ -639,6 +801,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             or result.get("latest_copy_path")
         )
         wiz["ram_input_path"] = ram_input_path
+        wiz["classified_path"] = outputs.get("classified_path")
+        wiz["readiness_payload"] = outputs.get("readiness")
 
         readiness = outputs.get("readiness") or {}
         ok_to_simulate = outputs.get("ok_to_simulate")
@@ -646,6 +810,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(
             state,
             "RAM input sheet created.\n"
+            f"- source workbook: {wiz.get('source_artifact_title') or wiz.get('excel_path')}\n"
             f"- ok_to_simulate: {ok_to_simulate}\n"
             f"- readiness: {readiness}\n"
             f"- RAM input path: {ram_input_path}\n"
@@ -656,7 +821,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         return state
 
     if wiz["step"] == "sim_confirm":
-        ans = user_text_stripped.lower()
+        ans = user_lower
         if ans in {"no", "n"}:
             wiz["active"] = False
             wiz["step"] = "done"
@@ -749,6 +914,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         wiz["sim_archive_dir"] = archive.run_dir
+        wiz["sim_metadata_path"] = archive.metadata_path
+        wiz["sim_outputs"] = archive.outputs
+        wiz["sim_conditions"] = archive.conditions
         wiz["active"] = False
         wiz["step"] = "done"
         _wizard_reply(
@@ -765,6 +933,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     return state
 
 
+# -------------------------
+# Graph build
+# -------------------------
 def get_graph():
     builder = StateGraph(AgentState)
     builder.add_node("router", node_router)

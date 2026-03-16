@@ -361,6 +361,117 @@ def _build_artifact_context_for_conversation(conversation_id: str) -> Dict[str, 
     }
 
 
+def _build_conversation_artifact_inventory(conversation_id: str) -> List[Dict[str, Any]]:
+    rows = list_artifacts(conversation_id)
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "id": str(r["id"]),
+                "conversation_id": str(r["conversation_id"]),
+                "run_id": str(r["run_id"]) if r.get("run_id") else None,
+                "output_type": r.get("output_type"),
+                "title": r.get("title"),
+                "storage_provider": r.get("storage_provider"),
+                "storage_key": r.get("storage_key"),
+                "mime_type": r.get("mime_type"),
+                "metadata": r.get("metadata") or {},
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            }
+        )
+    return items
+
+
+def _artifact_exists(conversation_id: str, output_type: str, storage_key: Optional[str]) -> bool:
+    if not storage_key:
+        return False
+    rows = list_artifacts(conversation_id)
+    for row in rows:
+        if row.get("output_type") == output_type and row.get("storage_key") == storage_key:
+            return True
+    return False
+
+
+def _persist_generated_ram_artifacts(conversation_id: str, run_id: str, out: Dict[str, Any]) -> List[str]:
+    created: List[str] = []
+    wiz = (out or {}).get("ram_wizard") or {}
+
+    candidates = [
+        {
+            "path": wiz.get("ram_input_path"),
+            "title": Path(wiz["ram_input_path"]).name if wiz.get("ram_input_path") else None,
+            "output_type": "ram_input_workbook",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+        {
+            "path": wiz.get("classified_path"),
+            "title": Path(wiz["classified_path"]).name if wiz.get("classified_path") else None,
+            "output_type": "ram_classified_workbook",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+        {
+            "path": wiz.get("sim_metadata_path"),
+            "title": Path(wiz["sim_metadata_path"]).name if wiz.get("sim_metadata_path") else None,
+            "output_type": "ram_simulation_metadata",
+            "mime_type": "application/json",
+        },
+    ]
+
+    sim_outputs = wiz.get("sim_outputs") or {}
+    for key, path_str in sim_outputs.items():
+        if not path_str:
+            continue
+        ext = Path(path_str).suffix.lower()
+        mime = "text/csv" if ext == ".csv" else "application/octet-stream"
+        candidates.append(
+            {
+                "path": path_str,
+                "title": Path(path_str).name,
+                "output_type": f"ram_simulation_output:{key}",
+                "mime_type": mime,
+            }
+        )
+
+    sim_conditions = wiz.get("sim_conditions") or {}
+    for key, path_str in sim_conditions.items():
+        if not path_str:
+            continue
+        ext = Path(path_str).suffix.lower()
+        mime = "text/csv" if ext == ".csv" else "application/octet-stream"
+        candidates.append(
+            {
+                "path": path_str,
+                "title": Path(path_str).name,
+                "output_type": f"ram_simulation_condition:{key}",
+                "mime_type": mime,
+            }
+        )
+
+    for item in candidates:
+        path_str = item.get("path")
+        if not path_str:
+            continue
+        path = Path(path_str)
+        if not path.exists() or not path.is_file():
+            continue
+        if _artifact_exists(conversation_id, item["output_type"], str(path.resolve())):
+            continue
+
+        insert_agent_output(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            output_type=item["output_type"],
+            title=item.get("title"),
+            storage_provider="local",
+            storage_key=str(path.resolve()),
+            mime_type=item.get("mime_type"),
+            metadata={"generated_by": "ram_wizard"},
+        )
+        created.append(item["output_type"])
+
+    return created
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-squared-backend", "status": "running"}
@@ -619,6 +730,7 @@ def chat(req: ChatRequest, request: Request):
             "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
             "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
         }
+        state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
 
         user_msg_row = insert_message(
             conversation_id=conversation_id,
@@ -650,6 +762,15 @@ def chat(req: ChatRequest, request: Request):
         out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})
         SESSIONS[conversation_id] = out
 
+        created_output_types = _persist_generated_ram_artifacts(
+            conversation_id=conversation_id,
+            run_id=str(run["id"]),
+            out=out,
+        )
+        if created_output_types:
+            print(f"[chat] persisted_generated_outputs={created_output_types}", flush=True)
+            state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
+
         msgs = out.get("messages", [])
         assistant_msg = None
         for m in reversed(msgs):
@@ -677,6 +798,7 @@ def chat(req: ChatRequest, request: Request):
                 "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
                 "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
                 "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
+                "generated_output_types": created_output_types,
             },
         )
 
@@ -698,6 +820,7 @@ def chat(req: ChatRequest, request: Request):
                 "reply_preview": assistant_text[:200],
                 "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
                 "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
+                "generated_output_types": created_output_types,
             },
         )
 

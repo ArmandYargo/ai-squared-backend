@@ -9,12 +9,34 @@ from psycopg.types.json import Jsonb
 APP_DATABASE_URL = os.environ.get("APP_DATABASE_URL")
 
 
+def _normalized_db_url() -> str:
+    url = (APP_DATABASE_URL or "").strip()
+    if not url:
+        raise RuntimeError("APP_DATABASE_URL is not set.")
+
+    if "sslmode=" not in url:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+
+    return url
+
+
 @contextmanager
 def get_conn():
-    if not APP_DATABASE_URL:
-        raise RuntimeError("APP_DATABASE_URL is not set.")
-    with connect(APP_DATABASE_URL, row_factory=dict_row) as conn:
+    url = _normalized_db_url()
+    conn = connect(
+        url,
+        row_factory=dict_row,
+        connect_timeout=15,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    try:
         yield conn
+    finally:
+        conn.close()
 
 
 def list_conversations(owner_key: str) -> List[Dict[str, Any]]:
@@ -294,7 +316,8 @@ def list_artifact_storage_keys_for_conversation(
         )
         rows = cur.fetchall()
         return [r["storage_key"] for r in rows if r.get("storage_key")]
-        
+
+
 def update_conversation_title(
     conversation_id: str,
     owner_key: str,

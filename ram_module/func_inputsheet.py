@@ -240,6 +240,8 @@ def build_comp_att_from_summary(
     *,
     machine_type: str,
     model: str = MODEL_DEFAULT,
+    time_tbl_value: int | None = None,
+    component_practices: dict | None = None,
 ) -> pd.DataFrame:
     """
     Map category_summary -> comp_att per your rules.
@@ -322,8 +324,15 @@ def build_comp_att_from_summary(
         else:
             merged[c] = merged[c].fillna(d)
 
-    rng = random.Random(0)
-    time_tbl = [rng.randint(0,3) for _ in range(n_rows)]
+    if component_practices:
+        subcols = merged["subcomponent"].astype(str).tolist()
+        default = int(time_tbl_value) if time_tbl_value is not None else 0
+        time_tbl = [component_practices.get(sub, default) for sub in subcols]
+    elif time_tbl_value is not None:
+        time_tbl = [int(time_tbl_value)] * n_rows
+    else:
+        rng = random.Random(0)
+        time_tbl = [rng.randint(0, 3) for _ in range(n_rows)]
     use_tbl = [0]*n_rows
     component = [machine_type]*n_rows
 

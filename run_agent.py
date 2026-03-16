@@ -1,6 +1,11 @@
 # run_agent.py
 import uuid
-from agent.graph import get_graph
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from agent.graph import get_graph  # noqa: E402
+from agent.state import AgentState  # noqa: E402
 
 
 def main():
@@ -14,7 +19,7 @@ def main():
     graph = get_graph()
     thread_id = str(uuid.uuid4())
 
-    state = {
+    state: AgentState = {
         "messages": [],
         "ram_wizard": {"active": False, "step": "machine"},
         "intent": "qa",
@@ -27,7 +32,7 @@ def main():
 
         state["messages"] = state.get("messages", []) + [{"role": "user", "content": user}]
         out = graph.invoke(state, config={"configurable": {"thread_id": thread_id}})
-        state = out
+        state = out  # type: ignore[assignment]
 
         msgs = out.get("messages") or []
         if msgs and msgs[-1].get("role") == "assistant":

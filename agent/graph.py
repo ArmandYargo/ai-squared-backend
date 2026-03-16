@@ -38,7 +38,7 @@ def _llm_text(messages: List[Dict[str, str]]) -> str:
 
     resp = client.chat.completions.create(
         model=model,
-        messages=messages,
+        messages=messages,  # type: ignore[arg-type]
         temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
@@ -291,10 +291,12 @@ def node_router(state: AgentState) -> AgentState:
 
     if t.startswith("?") or t.lower().startswith("/ask "):
         state["intent"] = "qa"
-        if t.startswith("?"):
-            state["messages"][-1]["content"] = t[1:].strip()
-        else:
-            state["messages"][-1]["content"] = t[5:].strip()
+        msgs_list = state.get("messages") or []
+        if msgs_list:
+            if t.startswith("?"):
+                msgs_list[-1]["content"] = t[1:].strip()
+            else:
+                msgs_list[-1]["content"] = t[5:].strip()
         return state
 
     if t.lower().startswith("/ram"):
@@ -540,6 +542,30 @@ def _format_numbered_categories(cats: List[str]) -> str:
     return "\n".join([f"{i + 1}. {c}" for i, c in enumerate(cats)])
 
 
+_PRACTICE_CODE_TO_NAME = {0: "Reactive", 1: "Corrective", 2: "Preventative", 3: "Condition based"}
+_PRACTICE_NAME_TO_CODE = {
+    "reactive": 0, "corrective": 1,
+    "preventative": 2, "preventive": 2,
+    "condition based": 3, "condition-based": 3, "cbm": 3,
+}
+
+
+def _format_component_practices(cats: List[str], practices: Dict[str, int]) -> str:
+    if not cats:
+        return "(no components)"
+    max_len = max(len(c) for c in cats)
+    lines = []
+    for i, c in enumerate(cats):
+        code = practices.get(c, 0)
+        name = _PRACTICE_CODE_TO_NAME.get(code, "Reactive")
+        lines.append(f"{i + 1}. {c:<{max_len}}  ->  {name}")
+    return "\n".join(lines)
+
+
+def _build_default_practices(cats: List[str], default_code: int) -> Dict[str, int]:
+    return {c: default_code for c in cats}
+
+
 def node_ram_wizard(state: AgentState) -> AgentState:
     wiz = state.get("ram_wizard") or {}
     state["ram_wizard"] = wiz
@@ -548,6 +574,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     wiz.setdefault("step", "machine")
 
     wiz.setdefault("machine", None)
+    wiz.setdefault("maintenance_practice", None)
     wiz.setdefault("date_range_text", None)
     wiz.setdefault("excel_path", None)
     wiz.setdefault("source_artifact_id", None)
@@ -555,6 +582,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
     wiz.setdefault("categories", None)
     wiz.setdefault("categories_last_ai", None)
+    wiz.setdefault("component_practices", None)
     wiz.setdefault("readiness_payload", None)
 
     wiz.setdefault("ram_input_path", None)
@@ -613,7 +641,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         return state
 
-    user_text = (state.get("messages")[-1].get("content", "") if state.get("messages") else "")
+    _msgs = state.get("messages") or []
+    user_text = (_msgs[-1].get("content", "") if _msgs else "")
     user_text_stripped = user_text.strip()
     user_lower = user_text_stripped.lower()
 
@@ -622,9 +651,46 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Please enter the machine name/type.")
             return state
         wiz["machine"] = user_text_stripped
+        wiz["step"] = "maintenance_practice"
+        _wizard_reply(
+            state,
+            "What maintenance practice is currently used on this machine?\n"
+            "1. Reactive\n"
+            "2. Corrective\n"
+            "3. Preventative\n"
+            "4. Condition based\n\n"
+            "Type the number or name of the practice."
+        )
+        return state
+
+    _MAINT_PRACTICE_MAP = {
+        "1": 0, "reactive": 0,
+        "2": 1, "corrective": 1,
+        "3": 2, "preventative": 2, "preventive": 2,
+        "4": 3, "condition based": 3, "condition-based": 3, "cbm": 3,
+    }
+
+    if wiz["step"] == "maintenance_practice":
+        if not user_text_stripped:
+            _wizard_reply(state, "Please select a maintenance practice (1-4).")
+            return state
+        key = user_lower.strip()
+        if key not in _MAINT_PRACTICE_MAP:
+            _wizard_reply(
+                state,
+                "Unrecognised option. Please type one of:\n"
+                "1. Reactive\n"
+                "2. Corrective\n"
+                "3. Preventative\n"
+                "4. Condition based"
+            )
+            return state
+        wiz["maintenance_practice"] = _MAINT_PRACTICE_MAP[key]
+        label = {0: "Reactive", 1: "Corrective", 2: "Preventative", 3: "Condition based"}[wiz["maintenance_practice"]]
         wiz["step"] = "date"
         _wizard_reply(
             state,
+            f"Maintenance practice set to: {label}.\n\n"
             "Optional: enter a date range (e.g., '2019-01-01 to 2021-12-31' or '2023-2024') or type 'skip'."
         )
         return state
@@ -677,8 +743,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         try:
             payload = check_ram_readiness(
-                excel_path=wiz["excel_path"],
-                machine=wiz["machine"],
+                excel_path=wiz.get("excel_path") or "",
+                machine=wiz.get("machine") or "",
             )
         except Exception as e:
             _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}")
@@ -717,7 +783,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "categories_edit"
         if not wiz.get("categories"):
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
-            cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
+            cats = ai_propose_components_coarse(wiz.get("machine") or "", model=model)
             wiz["categories"] = cats
             wiz["categories_last_ai"] = list(cats) if isinstance(cats, list) else cats
 
@@ -731,15 +797,29 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         return state
 
+    def _go_to_maintenance_review():
+        cats = wiz.get("categories") or []
+        default_code = wiz.get("maintenance_practice", 0) or 0
+        practices = _build_default_practices(cats, default_code)
+        wiz["component_practices"] = practices
+        wiz["step"] = "maintenance_review"
+        default_name = _PRACTICE_CODE_TO_NAME.get(default_code, "Reactive")
+        _wizard_reply(
+            state,
+            f"Categories accepted.\n\n"
+            f"Component maintenance practices (default: {default_name}):\n"
+            f"{_format_component_practices(cats, practices)}\n\n"
+            "Happy with these maintenance practices? (y/n)"
+        )
+
     if wiz["step"] == "categories_edit":
         if user_text == "":
-            wiz["step"] = "confirm_create"
-            _wizard_reply(state, "Categories accepted.\n\nReady to create the RAM input sheet. Type 'yes' to proceed or 'no' to cancel.")
+            _go_to_maintenance_review()
             return state
 
         if user_lower == "reset":
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
-            cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
+            cats = ai_propose_components_coarse(wiz.get("machine") or "", model=model)
             wiz["categories"] = cats
             wiz["categories_last_ai"] = list(cats) if isinstance(cats, list) else cats
             _wizard_reply(
@@ -772,8 +852,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         t = user_lower
 
         if t in {"y", "yes"}:
-            wiz["step"] = "confirm_create"
-            _wizard_reply(state, "Great.\n\nReady to create the RAM input sheet. Type 'yes' to proceed or 'no' to cancel.")
+            _go_to_maintenance_review()
             return state
 
         if t in {"n", "no"}:
@@ -787,7 +866,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
         if t == "reset":
             model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
-            cats = ai_propose_components_coarse(wiz.get("machine"), model=model)
+            cats = ai_propose_components_coarse(wiz.get("machine") or "", model=model)
             wiz["categories"] = cats
             wiz["categories_last_ai"] = list(cats) if isinstance(cats, list) else cats
             _wizard_reply(
@@ -815,6 +894,82 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         )
         return state
 
+    if wiz["step"] == "maintenance_review":
+        t = user_lower
+        if t in {"y", "yes"}:
+            wiz["step"] = "confirm_create"
+            _wizard_reply(state, "Great.\n\nReady to create the RAM input sheet. Type 'yes' to proceed or 'no' to cancel.")
+            return state
+        if t in {"n", "no"}:
+            wiz["step"] = "maintenance_edit"
+            cats = wiz.get("categories") or []
+            _wizard_reply(
+                state,
+                "Edit maintenance practices:\n"
+                "Type 'all: [practice]' to change all components, or\n"
+                "list specific changes like '1: Preventative, 3: Condition based'\n\n"
+                "Practices: Reactive, Corrective, Preventative, Condition based\n\n"
+                f"{_format_component_practices(cats, wiz.get('component_practices') or {})}"
+            )
+            return state
+        _wizard_reply(state, "Please type 'y' (accept) or 'n' (edit practices).")
+        return state
+
+    if wiz["step"] == "maintenance_edit":
+        cats = wiz.get("categories") or []
+        practices = dict(wiz.get("component_practices") or {})
+        raw = user_text_stripped
+
+        # Parse "all: Practice"
+        if raw.lower().startswith("all:"):
+            pname = raw[4:].strip().lower()
+            code = _PRACTICE_NAME_TO_CODE.get(pname)
+            if code is None:
+                _wizard_reply(
+                    state,
+                    f"Unknown practice '{raw[4:].strip()}'. "
+                    "Use: Reactive, Corrective, Preventative, or Condition based."
+                )
+                return state
+            for c in cats:
+                practices[c] = code
+        else:
+            # Parse "1: Preventative, 3: Condition based"
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            errors = []
+            for part in parts:
+                if ":" not in part:
+                    errors.append(f"'{part}' -- expected format 'number: practice'")
+                    continue
+                num_str, pname = part.split(":", 1)
+                num_str = num_str.strip()
+                pname = pname.strip().lower()
+                if not num_str.isdigit():
+                    errors.append(f"'{num_str}' is not a valid component number")
+                    continue
+                idx = int(num_str) - 1
+                if idx < 0 or idx >= len(cats):
+                    errors.append(f"Component {num_str} is out of range (1-{len(cats)})")
+                    continue
+                code = _PRACTICE_NAME_TO_CODE.get(pname)
+                if code is None:
+                    errors.append(f"Unknown practice '{pname}'. Use: Reactive, Corrective, Preventative, Condition based")
+                    continue
+                practices[cats[idx]] = code
+            if errors:
+                _wizard_reply(state, "Could not parse some edits:\n" + "\n".join(f"  - {e}" for e in errors))
+                return state
+
+        wiz["component_practices"] = practices
+        wiz["step"] = "maintenance_review"
+        _wizard_reply(
+            state,
+            "Updated maintenance practices:\n"
+            f"{_format_component_practices(cats, practices)}\n\n"
+            "Happy with these maintenance practices? (y/n)"
+        )
+        return state
+
     if wiz["step"] == "confirm_create":
         ans = user_lower
         if ans in {"no", "n", "cancel"}:
@@ -831,6 +986,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 machine_type=wiz.get("machine"),
                 date_range_text=wiz.get("date_range_text"),
                 preferred_categories=wiz.get("categories"),
+                maintenance_practice=wiz.get("maintenance_practice"),
+                component_practices=wiz.get("component_practices"),
             )
         except Exception as e:
             _wizard_reply(state, f"Input-sheet pipeline failed: {type(e).__name__}: {e}")
@@ -909,7 +1066,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Please answer 'yes' or 'no'.")
             return state
 
-        d0, d1 = _default_dates_from_input_sheet(wiz.get("ram_input_path")) if wiz.get("ram_input_path") else (None, None)
+        d0, d1 = _default_dates_from_input_sheet(wiz.get("ram_input_path") or "") if wiz.get("ram_input_path") else (None, None)
         wiz["_sim_default_start"] = str(d0) if d0 else None
         wiz["_sim_default_end"] = str(d1) if d1 else None
 
@@ -968,12 +1125,12 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
     if wiz["step"] == "sim_run":
         try:
-            start = _parse_date_yyyy_mm_dd(wiz.get("sim_start"))
-            end = _parse_date_yyyy_mm_dd(wiz.get("sim_end"))
+            start = _parse_date_yyyy_mm_dd(wiz.get("sim_start") or "")
+            end = _parse_date_yyyy_mm_dd(wiz.get("sim_end") or "")
             sims = int(wiz.get("simulations") or 200)
 
             archive = run_ram_simulation_archived(
-                input_xlsx=wiz.get("ram_input_path"),
+                input_xlsx=wiz.get("ram_input_path") or "",
                 start_date=start,
                 end_date=end,
                 simulations=sims,

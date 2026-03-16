@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import shutil
+import time as _time_mod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date
@@ -118,22 +119,22 @@ def _parse_yearish_range(text: str) -> Optional[Tuple[pd.Timestamp, pd.Timestamp
     if m:
         y1 = int(m.group(1))
         y2 = int(m.group(2))
-        start = pd.Timestamp(datetime(y1, 1, 1))
-        end = pd.Timestamp(datetime(y2, 12, 31, 23, 59, 59))
+        start: pd.Timestamp = pd.Timestamp(datetime(y1, 1, 1))  # type: ignore[assignment]
+        end: pd.Timestamp = pd.Timestamp(datetime(y2, 12, 31, 23, 59, 59))  # type: ignore[assignment]
         return start, end
 
     m = re.match(r"^\s*(\d{4})\s*$", t)
     if m:
         y = int(m.group(1))
-        start = pd.Timestamp(datetime(y, 1, 1))
-        end = pd.Timestamp(datetime(y, 12, 31, 23, 59, 59))
+        start = pd.Timestamp(datetime(y, 1, 1))  # type: ignore[assignment]
+        end = pd.Timestamp(datetime(y, 12, 31, 23, 59, 59))  # type: ignore[assignment]
         return start, end
 
     m = re.match(r"^\s*(\d{4})-(\d{2})\s*(?:-|/|to)\s*(\d{4})-(\d{2})\s*$", t, re.IGNORECASE)
     if m:
         y1, mo1, y2, mo2 = map(int, m.groups())
-        start = pd.Timestamp(datetime(y1, mo1, 1))
-        end = (pd.Timestamp(datetime(y2, mo2, 1)) + pd.offsets.MonthEnd(1)).replace(hour=23, minute=59, second=59)
+        start = pd.Timestamp(datetime(y1, mo1, 1))  # type: ignore[assignment]
+        end = (pd.Timestamp(datetime(y2, mo2, 1)) + pd.offsets.MonthEnd(1)).replace(hour=23, minute=59, second=59)  # type: ignore[assignment]
         return start, end
 
     return None
@@ -203,6 +204,8 @@ def run_ram_pipeline(
     excel_path: str | None = None,
     preferred_categories: Optional[List[str]] = None,
     category_edit_text: Optional[str] = None,
+    maintenance_practice: Optional[int] = None,
+    component_practices: Optional[Dict[str, int]] = None,
     model: str = "gpt-5.2",
     min_coverage: float = 0.50,
     match_scope: str = "both",
@@ -269,8 +272,13 @@ def run_ram_pipeline(
     log(f"✅ Categories set ({len(preferred_categories)}): {preferred_categories}")
 
     # Step 6/7: classify
-    log("Step 6/7: Run Step 4 classification (this can take a bit)…")
+    _SECS_PER_ROW = 2.3
+    _num_rows = len(df_filtered)
+    _est_secs = _num_rows * _SECS_PER_ROW
+    log("Step 6/7: Classify work-order rows into components (this can take a bit)…")
+    log(f"   Estimated time: ~{_est_secs:.0f}s (based on {_num_rows} rows @ ~{_SECS_PER_ROW}s/row)")
 
+    _cls_t0 = _time_mod.perf_counter()
     # IMPORTANT: your step4_with_query does NOT accept mapping=...
     classified_df, mapping2, end_row, stats, meta = step4_with_query(
         df_filtered,
@@ -278,7 +286,14 @@ def run_ram_pipeline(
         model=model,
         preferred_categories=preferred_categories,
     )
-    log(f"✅ Step 4 complete. Rows classified: {len(classified_df)}")
+    _cls_t1 = _time_mod.perf_counter()
+    _cls_elapsed = _cls_t1 - _cls_t0
+    _cls_err = ((_est_secs - _cls_elapsed) / _cls_elapsed * 100) if _cls_elapsed > 0 else 0
+    _cls_sign = "+" if _cls_err >= 0 else ""
+    log(
+        f"✅ Classification complete. Rows classified: {len(classified_df)} | "
+        f"Time: {_cls_elapsed:.1f}s | Prediction error: {_cls_sign}{_cls_err:.1f}%"
+    )
 
     # Write classified data to workbook
     log("Writing classified workbook…")
@@ -318,7 +333,11 @@ def run_ram_pipeline(
 
     # Step 7/7: Build RAM input workbook (using func_inputsheet correctly)
     log("Step 7/7: Export RAM input workbook…")
-    comp_att = build_comp_att_from_summary(summary_df, machine_type=machine, model=model)
+    comp_att = build_comp_att_from_summary(
+        summary_df, machine_type=machine, model=model,
+        time_tbl_value=maintenance_practice,
+        component_practices=component_practices,
+    )
     timelines = build_timelines(_start_date_for_timelines(date_meta))
     usage0 = build_usage0()
 
@@ -331,11 +350,21 @@ def run_ram_pipeline(
         overwrite=True,
     )
 
-    # Latest copy
-    shutil.copyfile(input_path, latest_path)
-
+    if not input_path.exists():
+        raise RuntimeError(f"Input workbook was not saved: {input_path}")
     log(f"✅ Input workbook written: {input_path}")
+
+    # Latest copy (always points to the most recent run)
+    shutil.copyfile(input_path, latest_path)
     log(f"✅ Latest copy written: {latest_path}")
+
+    # Timestamped backup so previous runs are preserved for inspection
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"ram_input_sheet_{ts}.xlsx"
+    backup_path = outputs_dir / backup_name
+    shutil.copyfile(input_path, backup_path)
+    log(f"✅ Backup saved: {backup_path}")
+
     log("=== RAM/Inputsheet pipeline finished ===")
 
     return {
@@ -419,6 +448,8 @@ def run_ram_pipeline_compat(**kwargs):
         "excel_path",
         "preferred_categories",
         "category_edit_text",
+        "maintenance_practice",
+        "component_practices",
         "model",
         "min_coverage",
         "match_scope",

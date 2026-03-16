@@ -778,7 +778,7 @@ def chat(req: ChatRequest, request: Request):
             },
         )
 
-        out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})
+        out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})  # type: ignore[arg-type]
         SESSIONS[conversation_id] = out
 
         created_output_types = _persist_generated_ram_artifacts(

@@ -42,7 +42,9 @@ import random
 import matplotlib.pyplot as plt
 from dateutil.relativedelta import relativedelta
 import math
+import time as _time_mod
 import xarray as xr
+from tqdm import tqdm
 
 # -------------------------------------------------------------------
 # NaN-safe helpers (agent robustness)
@@ -51,6 +53,21 @@ import xarray as xr
 # The legacy model sometimes casts these values directly with int(...), which raises:
 #   ValueError: cannot convert float NaN to integer
 # We centralize safe int conversion here and use it in timeline lookups / mappings.
+
+MAX_SAFE_DATE = date(9000, 1, 1)
+
+def _safe_date_add(base_date, days_offset):
+    """Add days to a date, clamping to MAX_SAFE_DATE to prevent OverflowError."""
+    try:
+        days_val = days_offset
+        if isinstance(days_val, float):
+            if math.isnan(days_val) or math.isinf(days_val):
+                return MAX_SAFE_DATE
+            days_val = int(days_val)
+        return base_date + timedelta(days=days_val)
+    except (OverflowError, ValueError):
+        return MAX_SAFE_DATE
+
 
 def _safe_int(x, default=0, min_v=None, max_v=None):
     # Return int(x) with NaN/None/blank safety.
@@ -178,7 +195,7 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
         dates = (start_date + relativedelta(months=i)).strftime("%Y-%m")
         date_range_months.append(dates)
         
-    date_range_days = pd.date_range(start_date, end_date, freq='M', inclusive="both").strftime('%Y-%m-%d').tolist()
+    date_range_days = pd.date_range(start_date, end_date, freq='ME', inclusive="both").strftime('%Y-%m-%d').tolist()
 
     #component attributes data
     globals()['comp_att_df'] = pd.read_excel (r"%s" % input_xlsx,'comp_att')
@@ -197,11 +214,14 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
     # ... [Rest of the existing simulation code, but remove global variable assignments] ...
     #simulation running information
 
-    for j in range(simulations):
-        #reset eta
-        print('sim',j)
-        ##!!! check if this works
-        #globals()['comp_att_df'] = pd.read_excel (r"%s" % input_xlsx,'comp_att')
+    _sim_durations = []
+    _sim_wall_start = _time_mod.perf_counter()
+    _first_sim_prediction = None
+
+    _pbar = tqdm(range(simulations), desc="Simulations", unit="sim", dynamic_ncols=True)
+    for j in _pbar:
+        _sim_t0 = _time_mod.perf_counter()
+
         globals()['comp_att_df'] = pd.read_excel (r"%s" % input_xlsx,'comp_att')
         
         env = simpy.Environment()
@@ -214,6 +234,40 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
             env.process(component(env,i,j))
 
         env.run(until=period_end)
+
+        _sim_t1 = _time_mod.perf_counter()
+        _sim_durations.append(_sim_t1 - _sim_t0)
+        _avg_per_sim = sum(_sim_durations) / len(_sim_durations)
+        _remaining = (simulations - (j + 1)) * _avg_per_sim
+
+        if j == 0:
+            _first_sim_prediction = _avg_per_sim * simulations
+
+        _pbar.set_postfix_str(
+            f"{_avg_per_sim:.2f}s/sim | ETA {_remaining:.0f}s"
+        )
+    _pbar.close()
+
+    _sim_wall_end = _time_mod.perf_counter()
+    _actual_total = _sim_wall_end - _sim_wall_start
+    _avg_final = _actual_total / max(simulations, 1)
+    _predicted_total = _first_sim_prediction if _first_sim_prediction else _actual_total
+
+    def _fmt_time(s):
+        if s < 60:
+            return f"{s:.1f}s"
+        m, sec = divmod(s, 60)
+        return f"{int(m)}m {sec:.0f}s"
+
+    _pred_err = ((_predicted_total - _actual_total) / _actual_total * 100) if _actual_total > 0 else 0
+    _sign = "+" if _pred_err >= 0 else ""
+    print(
+        f"\nSimulation complete: {simulations}/{simulations} in {_fmt_time(_actual_total)} "
+        f"(avg {_avg_final:.2f}s/sim)\n"
+        f"Predicted total: {_fmt_time(_predicted_total)} | "
+        f"Actual: {_fmt_time(_actual_total)} | "
+        f"Prediction error: {_sign}{_pred_err:.1f}%\n"
+    )
 
     ## Manipulate/aggregate results
 
@@ -268,12 +322,12 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
 
             #fill months between start and first event and calculate accumulated days
             if len(sim_date_ev) > 0:
-                first_date_list = pd.date_range(start_date, sim_date_ev[0], freq='M', inclusive="both").strftime('%Y-%m-%d').tolist()
+                first_date_list = pd.date_range(start_date, sim_date_ev[0], freq='ME', inclusive="both").strftime('%Y-%m-%d').tolist()
                 first_date_list.insert(0,start_date.strftime('%Y-%m-%d'))
                 first_date_list.append(sim_date_ev[0].strftime('%Y-%m-%d'))
             else:
                 # If no events, just use the full date range
-                first_date_list = pd.date_range(start_date, end_date, freq='M', inclusive="both").strftime('%Y-%m-%d').tolist()
+                first_date_list = pd.date_range(start_date, end_date, freq='ME', inclusive="both").strftime('%Y-%m-%d').tolist()
                 first_date_list.insert(0,start_date.strftime('%Y-%m-%d'))
                 first_date_list.append(end_date.strftime('%Y-%m-%d'))
 
@@ -300,8 +354,10 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
             #repeat steps for all events
             for k in range(1,len(sim_date_ev)):
                 #add mttr after last event date and fill months between events
-                temp_mttr_date = (pd.to_datetime(globals()['comp%s' % i + '_%s' % j + '_cond']['date'].iloc[-1]) + timedelta(days = globals()['comp%s' % i + '_%s' % j + '_cond']['mttr'].iloc[-1])).strftime('%Y-%m-%d')
-                temp_date_list = pd.date_range(temp_mttr_date, sim_date_ev[k], freq='M', inclusive="both").strftime('%Y-%m-%d').tolist()
+                _last_date = pd.to_datetime(globals()['comp%s' % i + '_%s' % j + '_cond']['date'].iloc[-1]).date()
+                _mttr_days = globals()['comp%s' % i + '_%s' % j + '_cond']['mttr'].iloc[-1]
+                temp_mttr_date = _safe_date_add(_last_date, _mttr_days).strftime('%Y-%m-%d')
+                temp_date_list = pd.date_range(temp_mttr_date, sim_date_ev[k], freq='ME', inclusive="both").strftime('%Y-%m-%d').tolist()
                 temp_date_list.insert(0,temp_mttr_date)
                 temp_date_list.append(sim_date_ev[k].strftime('%Y-%m-%d'))
 
@@ -1102,7 +1158,7 @@ def usage_fail_time(comp, time_step, weib_tf):
     usage_time['factor'] = [factor(r = usage_time.loc[j].loc['ratio'],m = comp_att_df.loc[comp].loc["factor_m"]) for j in range(len(usage_time['ratio']))]
     
     #truncate table from sim_date onwards
-    sim_date_opr = datetime.combine(start_date + timedelta(days=time_step), datetime.min.time())
+    sim_date_opr = datetime.combine(_safe_date_add(start_date, time_step), datetime.min.time())
     usage_time = usage_time.drop(usage_time[usage_time['acc_time']<timedelta(days=time_step)].index).reset_index(drop=True)
     usage_time.at[0,'from'] = sim_date_opr
     usage_time['diff_time'] = usage_time['to'] - usage_time['from']
@@ -1134,7 +1190,7 @@ def prev_ub_min_t(comp, time_step, tr):
     usage_time['factor'] = [factor(r = usage_time.loc[j].loc['ratio'],m = 0.8) for j in range(len(usage_time['ratio']))]
     
     #truncate table from sim_date onwards
-    sim_date_opr = datetime.combine(start_date + timedelta(days=time_step), datetime.min.time())
+    sim_date_opr = datetime.combine(_safe_date_add(start_date, time_step), datetime.min.time())
     usage_time = usage_time.drop(usage_time[usage_time['acc_time']<timedelta(days=time_step)].index).reset_index(drop=True)
     usage_time.at[0,'from'] = sim_date_opr
     usage_time['diff_time'] = usage_time['to'] - usage_time['from']
@@ -1223,7 +1279,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
             cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
             #maintenance practice changes - not an event
-            sim_date_opr = start_date + timedelta(days=time_step_opr)
+            sim_date_opr = _safe_date_add(start_date, time_step_opr)
             mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
             if mp_change == "yes":
                 prev_damage = min(1,1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
@@ -1247,7 +1303,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
             cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
             #maintenance practice changes - not an event
-            sim_date_opr = start_date + timedelta(days=time_step_opr)
+            sim_date_opr = _safe_date_add(start_date, time_step_opr)
             mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
             if mp_change == "yes":
                 prev_damage = 1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2)
@@ -1288,7 +1344,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                 cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
                 if mp_change == "yes":
                     prev_damage = min(1,1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
@@ -1311,7 +1367,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                 cond_at_event = round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2)
             
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
 
                 if mp_change == "yes":
@@ -1365,7 +1421,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                 cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
                 if mp_change == "yes":
                     prev_damage = min(1,1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
@@ -1389,7 +1445,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                 cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
                 if mp_change == "yes":
                     prev_damage = 1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2)
@@ -1419,7 +1475,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                 cond_at_event = max(0,round(pf_curve_cond(t=time_to_event,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
 
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
                 if mp_change == "yes":
                     prev_damage = min(1,1 - round(pf_curve_cond(t=time_to_change_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=weib_tf),2))
@@ -1445,7 +1501,7 @@ def time_to_event_func(comp, mp, rating, serv_ind, pa_ind, time_step_opr, prev_e
                     cond_at_event = max(0,round(pf_curve_cond(t=time_to_event_2,d_i=prev_damage,n=comp_att_df.loc[comp].loc["pf_n"],tf=prev_weib_tf),2))
 
                 #maintenance practice changes - not an event
-                sim_date_opr = start_date + timedelta(days=time_step_opr)
+                sim_date_opr = _safe_date_add(start_date, time_step_opr)
                 mp_change, time_to_change_2, time_to_change, next_mp, next_rating, next_serv_ind, next_pa_ind = find_next_maintenance_practice(date=sim_date_opr, time_step=time_step_opr, time_to_event_2=time_to_event_2, time_to_change = time_to_change, n= time_link)
 
                 if mp_change == "yes":
@@ -1525,7 +1581,7 @@ def component(env, name, sim_num):
         
             #(1) operating
             time_step_opr = float(env.now)
-            sim_date_opr = start_date + timedelta(days=time_step_opr)
+            sim_date_opr = _safe_date_add(start_date, time_step_opr)
             time_link = comp_att_df.loc[name].loc["time_tbl"]
             mp, rtg = find_maintenance_practice(sim_date_opr, time_link)
             serv_ind, pa_ind = find_serv(sim_date_opr, time_link)
@@ -1536,7 +1592,7 @@ def component(env, name, sim_num):
             #(2) event
             event_counter += 1
             time_step_evt = env.now
-            sim_date_evt = start_date + timedelta(days=time_step_evt)
+            sim_date_evt = _safe_date_add(start_date, time_step_evt)
             sim_date_evt.strftime('%Y-%m-%d')
             year = sim_date_evt.year
             month = sim_date_evt.month

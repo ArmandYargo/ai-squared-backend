@@ -1,42 +1,93 @@
+
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from psycopg import connect
+from psycopg import OperationalError, connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-APP_DATABASE_URL = os.environ.get("APP_DATABASE_URL")
+
+DEFAULT_CONNECT_TIMEOUT = int(os.environ.get("APP_DB_CONNECT_TIMEOUT", "15"))
+DEFAULT_CONNECT_RETRIES = max(1, int(os.environ.get("APP_DB_CONNECT_RETRIES", "3")))
+DEFAULT_RETRY_DELAY_SECONDS = float(os.environ.get("APP_DB_RETRY_DELAY_SECONDS", "0.75"))
+
+
+def _current_db_url() -> str:
+    return (os.environ.get("APP_DATABASE_URL") or "").strip()
 
 
 def _normalized_db_url() -> str:
-    url = (APP_DATABASE_URL or "").strip()
+    url = _current_db_url()
     if not url:
         raise RuntimeError("APP_DATABASE_URL is not set.")
 
-    if "sslmode=" not in url:
-        separator = "&" if "?" in url else "?"
-        url = f"{url}{separator}sslmode=require"
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
 
-    return url
+    query.setdefault("sslmode", "require")
+
+    # Neon pooled endpoints can be sensitive to channel binding negotiation from
+    # some hosted runtimes. Force-remove it here so bad query params do not take
+    # the whole app down.
+    query.pop("channel_binding", None)
+
+    normalized_query = urlencode(query, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, normalized_query, parts.fragment))
 
 
 @contextmanager
 def get_conn():
     url = _normalized_db_url()
-    conn = connect(
-        url,
-        row_factory=dict_row,
-        connect_timeout=15,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, DEFAULT_CONNECT_RETRIES + 1):
+        conn = None
+        try:
+            conn = connect(
+                url,
+                row_factory=dict_row,
+                connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            yield conn
+            return
+        except OperationalError as exc:
+            last_error = exc
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if attempt >= DEFAULT_CONNECT_RETRIES:
+                break
+            time.sleep(DEFAULT_RETRY_DELAY_SECONDS * attempt)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    raise OperationalError(
+        f"Unable to connect to APP_DATABASE_URL after {DEFAULT_CONNECT_RETRIES} attempt(s): {last_error}"
     )
-    try:
-        yield conn
-    finally:
-        conn.close()
+
+
+def check_db() -> Dict[str, Any]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT now() AS now_ts, current_database() AS db_name")
+        row = cur.fetchone() or {}
+        return {
+            "ok": True,
+            "db_name": row.get("db_name"),
+            "server_time": row.get("now_ts").isoformat() if row.get("now_ts") else None,
+        }
 
 
 def list_conversations(owner_key: str) -> List[Dict[str, Any]]:

@@ -15,6 +15,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from db import (
     list_conversations,
     create_conversation,
@@ -31,9 +33,8 @@ from db import (
     delete_conversation,
     list_artifact_storage_keys_for_conversation,
     update_conversation_title,
+    check_db,
 )
-
-load_dotenv()
 
 from agent.graph import get_graph  # noqa: E402
 
@@ -480,7 +481,16 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "ai-squared-backend"}
+    try:
+        db_status = check_db()
+    except Exception as e:
+        return {
+            "ok": False,
+            "service": "ai-squared-backend",
+            "database": {"ok": False, "error": f"{type(e).__name__}: {e}"},
+        }
+
+    return {"ok": True, "service": "ai-squared-backend", "database": db_status}
 
 
 @app.get("/api/me")
@@ -849,10 +859,30 @@ def chat(req: ChatRequest, request: Request):
             raw_state=None,
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        run_id = locals().get("run", {}).get("id") if isinstance(locals().get("run"), dict) else None
+        if run_id:
+            try:
+                finish_agent_run(
+                    run_id=str(run_id),
+                    status="failed",
+                    error_json={"detail": e.detail if hasattr(e, "detail") else str(e)},
+                )
+            except Exception:
+                traceback.print_exc()
         raise
     except Exception as e:
         traceback.print_exc()
+        run_id = locals().get("run", {}).get("id") if isinstance(locals().get("run"), dict) else None
+        if run_id:
+            try:
+                finish_agent_run(
+                    run_id=str(run_id),
+                    status="failed",
+                    error_json={"detail": f"{type(e).__name__}: {e}"},
+                )
+            except Exception:
+                traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 

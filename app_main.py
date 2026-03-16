@@ -276,8 +276,8 @@ def _extract_text_from_path(path_str: str, mime_type: Optional[str] = None) -> T
         return False, f"[Failed to extract text: {type(e).__name__}: {e}]"
 
 
-def _build_artifact_context_for_conversation(conversation_id: str) -> Dict[str, Any]:
-    rows = list_artifacts(conversation_id)
+def _build_artifact_context_for_conversation(conversation_id: str, artifact_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    rows = artifact_rows if artifact_rows is not None else list_artifacts(conversation_id)
 
     supported_blocks: List[str] = []
     used_artifact_ids: List[str] = []
@@ -363,8 +363,8 @@ def _build_artifact_context_for_conversation(conversation_id: str) -> Dict[str, 
     }
 
 
-def _build_conversation_artifact_inventory(conversation_id: str) -> List[Dict[str, Any]]:
-    rows = list_artifacts(conversation_id)
+def _build_conversation_artifact_inventory(conversation_id: str, artifact_rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    rows = artifact_rows if artifact_rows is not None else list_artifacts(conversation_id)
     items: List[Dict[str, Any]] = []
     for r in rows:
         items.append(
@@ -384,17 +384,22 @@ def _build_conversation_artifact_inventory(conversation_id: str) -> List[Dict[st
     return items
 
 
-def _artifact_exists(conversation_id: str, output_type: str, storage_key: Optional[str]) -> bool:
+def _artifact_exists(conversation_id: str, output_type: str, storage_key: Optional[str], artifact_rows: Optional[List[Dict[str, Any]]] = None) -> bool:
     if not storage_key:
         return False
-    rows = list_artifacts(conversation_id)
+    rows = artifact_rows if artifact_rows is not None else list_artifacts(conversation_id)
     for row in rows:
         if row.get("output_type") == output_type and row.get("storage_key") == storage_key:
             return True
     return False
 
 
-def _persist_generated_ram_artifacts(conversation_id: str, run_id: str, out: Dict[str, Any]) -> List[str]:
+def _persist_generated_ram_artifacts(
+    conversation_id: str,
+    run_id: str,
+    out: Dict[str, Any],
+    artifact_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
     created: List[str] = []
     wiz = (out or {}).get("ram_wizard") or {}
 
@@ -456,7 +461,7 @@ def _persist_generated_ram_artifacts(conversation_id: str, run_id: str, out: Dic
         path = Path(path_str)
         if not path.exists() or not path.is_file():
             continue
-        if _artifact_exists(conversation_id, item["output_type"], str(path.resolve())):
+        if _artifact_exists(conversation_id, item["output_type"], str(path.resolve()), artifact_rows=artifact_rows):
             continue
 
         insert_agent_output(
@@ -752,14 +757,15 @@ def chat(req: ChatRequest, request: Request):
         state.setdefault("ram_wizard", {"active": False, "step": "machine"})
         state.setdefault("intent", "qa")
 
-        artifact_context_info = _build_artifact_context_for_conversation(conversation_id)
+        artifact_rows = list_artifacts(conversation_id)
+        artifact_context_info = _build_artifact_context_for_conversation(conversation_id, artifact_rows=artifact_rows)
         state["artifact_context"] = artifact_context_info.get("artifact_context", "")
         state["artifact_meta"] = {
             "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
             "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
             "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
         }
-        state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
+        state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id, artifact_rows=artifact_rows)
 
         user_msg_row = insert_message(
             conversation_id=conversation_id,
@@ -795,9 +801,11 @@ def chat(req: ChatRequest, request: Request):
             conversation_id=conversation_id,
             run_id=str(run["id"]),
             out=out,
+            artifact_rows=artifact_rows,
         )
         if created_output_types:
-            state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
+            artifact_rows = list_artifacts(conversation_id)
+            out["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id, artifact_rows=artifact_rows)
 
         msgs = out.get("messages", [])
         assistant_msg = None

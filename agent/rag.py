@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union, Callable, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from agent.chunking import SmartChunker
 from agent.embeddings import embed_dim, embed_query, embed_texts
@@ -15,6 +17,24 @@ from agent.loaders import load_text
 
 PathLike = Union[str, Path]
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
+
+
+DEFAULT_RAG_CONNECT_TIMEOUT = int(os.environ.get("RAG_DB_CONNECT_TIMEOUT", "15"))
+DEFAULT_RAG_CONNECT_RETRIES = max(1, int(os.environ.get("RAG_DB_CONNECT_RETRIES", "3")))
+DEFAULT_RAG_RETRY_DELAY_SECONDS = float(os.environ.get("RAG_DB_RETRY_DELAY_SECONDS", "0.75"))
+
+
+def _normalize_rag_db_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        raise RuntimeError("RAG database URL is not set.")
+
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.setdefault("sslmode", "require")
+    query.pop("channel_binding", None)
+    normalized_query = urlencode(query, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, normalized_query, parts.fragment))
 
 
 class RagStore:
@@ -35,7 +55,8 @@ class RagStore:
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
-        self.db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
+        raw_db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
+        self.db_url = _normalize_rag_db_url(raw_db_url or "") if raw_db_url else None
         if not self.db_url:
             raise RuntimeError(
                 "RAG requires DATABASE_URL (Neon Postgres connection string). "
@@ -50,14 +71,47 @@ class RagStore:
     # -------------------------
     def _connect(self):
         if self._conn is not None:
-            return self._conn
+            try:
+                if getattr(self._conn, "closed", False):
+                    self._conn = None
+                else:
+                    with self._conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    return self._conn
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
         try:
             import psycopg
+            from psycopg import OperationalError
         except Exception as e:
             raise RuntimeError("Missing dependency: psycopg. Install: pip install psycopg[binary]") from e
 
-        self._conn = psycopg.connect(self.db_url)
-        return self._conn
+        last_error = None
+        for attempt in range(1, DEFAULT_RAG_CONNECT_RETRIES + 1):
+            try:
+                self._conn = psycopg.connect(
+                    self.db_url,
+                    connect_timeout=DEFAULT_RAG_CONNECT_TIMEOUT,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                )
+                return self._conn
+            except OperationalError as e:
+                last_error = e
+                if attempt >= DEFAULT_RAG_CONNECT_RETRIES:
+                    break
+                time.sleep(DEFAULT_RAG_RETRY_DELAY_SECONDS * attempt)
+
+        raise RuntimeError(
+            f"Unable to connect to RAG database after {DEFAULT_RAG_CONNECT_RETRIES} attempt(s): {last_error}"
+        )
 
     def _ensure_schema(self):
         conn = self._connect()

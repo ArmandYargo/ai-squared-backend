@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from langgraph.graph import StateGraph, END
@@ -18,8 +18,9 @@ except Exception:
 
 from agent.state import AgentState
 from agent.ram_tool import run_ram_pipeline_compat, check_ram_readiness
-from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
 from agent.ram_simulation_tool import run_ram_simulation_archived
+from agent.rag import RagStore
+from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
 
 
 # -------------------------
@@ -46,8 +47,100 @@ def _llm_text(messages: List[Dict[str, str]]) -> str:
 def _is_greeting(text: str) -> bool:
     t = (text or "").strip().lower()
     return t in {
-        "hi", "hello", "hey", "howzit", "morning",
-        "good morning", "good afternoon", "good evening"
+        "hi",
+        "hello",
+        "hey",
+        "howzit",
+        "morning",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+
+
+# -------------------------
+# RAG helpers
+# -------------------------
+_RAG_STORE: Optional[RagStore] = None
+
+
+def _get_rag_store() -> Optional[RagStore]:
+    global _RAG_STORE
+    if os.environ.get("RAG_ENABLED", "1") != "1":
+        return None
+    if _RAG_STORE is not None:
+        return _RAG_STORE
+    try:
+        _RAG_STORE = RagStore()
+        return _RAG_STORE
+    except Exception as e:
+        print(f"[rag] init failed: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _rag_confidence_from_distance(distance: Optional[float]) -> float:
+    """
+    pgvector cosine distance is lower when more similar.
+    For normalized embeddings, similarity ~= 1 - distance.
+    We clamp to [0,1] and express as 0..100 confidence.
+    """
+    if distance is None:
+        return 0.0
+    sim = 1.0 - float(distance)
+    sim = max(0.0, min(1.0, sim))
+    return sim * 100.0
+
+
+def _retrieve_rag_context(query: str, *, namespace: str = "knowledge", k: int = 6) -> Dict[str, Any]:
+    store = _get_rag_store()
+    if store is None:
+        return {
+            "enabled": False,
+            "used": False,
+            "confidence": 0.0,
+            "hits": [],
+            "context": "",
+        }
+
+    try:
+        hits = store.retrieve(query, k=k, namespace=namespace)
+    except Exception as e:
+        print(f"[rag] retrieve failed: {type(e).__name__}: {e}", flush=True)
+        return {
+            "enabled": True,
+            "used": False,
+            "confidence": 0.0,
+            "hits": [],
+            "context": "",
+        }
+
+    if not hits:
+        return {
+            "enabled": True,
+            "used": False,
+            "confidence": 0.0,
+            "hits": [],
+            "context": "",
+        }
+
+    top_conf = max(_rag_confidence_from_distance(h.get("distance")) for h in hits)
+    threshold = float(os.environ.get("RAG_CONFIDENCE_THRESHOLD", "70"))
+
+    context_blocks: List[str] = []
+    for i, h in enumerate(hits, start=1):
+        meta = h.get("meta") or {}
+        source = meta.get("source") or meta.get("path") or "unknown"
+        text = (h.get("text") or "").strip()
+        if not text:
+            continue
+        context_blocks.append(f"[Source {i}] {source}\n{text}")
+
+    return {
+        "enabled": True,
+        "used": top_conf >= threshold,
+        "confidence": top_conf,
+        "hits": hits,
+        "context": "\n\n".join(context_blocks),
     }
 
 
@@ -81,16 +174,29 @@ def _latest_excel_artifact(state: AgentState) -> Optional[Dict[str, Any]]:
     return excel_artifacts[0]
 
 
+def _latest_uploaded_excel_for_simulation(state: AgentState, current_source_artifact_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    artifacts = state.get("conversation_artifacts") or []
+    excel_artifacts = [a for a in artifacts if _is_excel_artifact(a)]
+    if not excel_artifacts:
+        return None
+
+    latest = excel_artifacts[0]
+    latest_id = latest.get("id")
+    if current_source_artifact_id and str(latest_id) == str(current_source_artifact_id):
+        return None
+    return latest
+
+
 def _artifact_prompt_hint(state: AgentState) -> str:
     latest = _latest_excel_artifact(state)
     if not latest:
         return (
-            "Please upload the CMMS Excel workbook into this conversation, then say "
-            "'use uploaded file' or continue the wizard."
+            "Please upload the CMMS Excel workbook into this conversation.\n"
+            "Once uploaded, I’ll let you choose whether to proceed with it or upload a new file."
         )
     return (
         f"I found an uploaded workbook in this conversation: {latest.get('title')}\n"
-        "Reply with 'use uploaded file' to use it, or paste a different path if needed."
+        "Reply with 'proceed' to use it, or 'upload new' if you want to upload a different file."
     )
 
 
@@ -151,7 +257,7 @@ def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
         "or proceed with simulation steps.\n\n"
         "Rules:\n"
         "- If the user asks about an uploaded file, document, summary, comparison, or attached material, choose qa.\n"
-        "- If the user wants to build an input sheet, run RAM, use an uploaded workbook, continue a wizard, "
+        "- If the user wants to build an input sheet, run RAM, continue a wizard, review an input sheet, "
         "or start simulation, choose ram_wizard.\n"
         "- If the user is supplying machine/date/file/category/simulation values while wizard is active, choose ram_wizard.\n"
         "- If unclear, prefer qa.\n\n"
@@ -224,7 +330,7 @@ def node_router(state: AgentState) -> AgentState:
 
 
 # -------------------------
-# QA node
+# QA node (RAG first, then generic)
 # -------------------------
 def node_qa(state: AgentState) -> AgentState:
     print("[node_qa] entered", flush=True)
@@ -250,6 +356,15 @@ def node_qa(state: AgentState) -> AgentState:
     used_titles = artifact_meta.get("used_artifact_titles") or []
     skipped_artifacts = artifact_meta.get("skipped_artifacts") or []
 
+    rag = _retrieve_rag_context(question)
+    rag_used = rag.get("used", False)
+    rag_conf = rag.get("confidence", 0.0)
+    rag_context = (rag.get("context") or "").strip()
+    rag_hits = rag.get("hits") or []
+
+    state["rag_hits"] = rag_hits
+
+    print(f"[node_qa] rag_used={rag_used} rag_conf={rag_conf}", flush=True)
     print(f"[node_qa] used_titles={used_titles}", flush=True)
     print(f"[node_qa] skipped_artifacts={skipped_artifacts}", flush=True)
     print(f"[node_qa] artifact_context_length={len(artifact_context)}", flush=True)
@@ -265,17 +380,6 @@ def node_qa(state: AgentState) -> AgentState:
             "what files",
             "what attachments",
             "uploaded artifacts do you have access to",
-        ]
-    )
-
-    asks_for_summary = any(
-        phrase in q_lower
-        for phrase in [
-            "summarise",
-            "summarize",
-            "summary",
-            "summarise this document",
-            "summarize this document",
         ]
     )
 
@@ -297,33 +401,7 @@ def node_qa(state: AgentState) -> AgentState:
                 for item in skipped_artifacts
             )
         else:
-            reply = (
-                "I do not currently have any usable uploaded artifact text in this conversation. "
-                "That usually means no files are attached to this chat yet, or extraction failed."
-            )
-
-        state.setdefault("messages", []).append(
-            {"role": "assistant", "content": reply, "speaker": "LLM"}
-        )
-        return state
-
-    if asks_for_summary and not artifact_context:
-        if skipped_artifacts:
-            reply = (
-                "I found uploaded artifact(s), but I could not extract usable text from them.\n\n"
-                "Extraction results:\n"
-                + "\n".join(
-                    f"- {item.get('title') or 'Untitled'}: {item.get('reason') or 'Skipped'}"
-                    for item in skipped_artifacts
-                )
-                + "\n\nThis usually means the PDF is scanned/image-based, the extraction library is missing, "
-                  "or the file type is not yet supported."
-            )
-        else:
-            reply = (
-                "I don’t have any extracted document text available in this conversation yet. "
-                "The file may not have been attached to this chat, or no usable text was extracted."
-            )
+            reply = "I do not currently have any usable uploaded artifact text in this conversation."
 
         state.setdefault("messages", []).append(
             {"role": "assistant", "content": reply, "speaker": "LLM"}
@@ -331,20 +409,19 @@ def node_qa(state: AgentState) -> AgentState:
         return state
 
     system_prompt = (
-        "You are a helpful engineering and document-analysis assistant.\n"
-        "If document context is provided, answer using that material first.\n"
-        "Be explicit when your answer is based on uploaded documents.\n"
-        "If the uploaded documents do not contain the answer, say that clearly.\n"
-        "Do not pretend to have read attachments unless document context is actually present.\n"
-        "If useful, provide a concise structured answer."
+        "You are a helpful engineering, reliability, and document-analysis assistant.\n"
+        "Priority order:\n"
+        "1. If uploaded document context is present and relevant, use it.\n"
+        "2. If RAG context is present with strong confidence, use it.\n"
+        "3. Otherwise answer from general knowledge and be clear when you are doing so.\n"
+        "Never fabricate cited facts from missing context."
     )
 
     user_parts: List[str] = []
 
     if artifact_context:
         user_parts.append(
-            "The following extracted document context comes from uploaded artifacts in this conversation.\n"
-            "Use it as the primary source for the answer.\n\n"
+            "Uploaded document context:\n"
             f"{artifact_context}"
         )
 
@@ -362,17 +439,20 @@ def node_qa(state: AgentState) -> AgentState:
             "Some uploaded artifacts were not usable for text extraction:\n" + "\n".join(skipped_lines)
         )
 
+    if rag_used and rag_context:
+        user_parts.append(
+            f"RAG context (confidence {rag_conf:.1f}%):\n{rag_context}"
+        )
+
     user_parts.append(f"User question:\n{question}")
     combined_user_prompt = "\n\n".join(user_parts)
 
-    print("[node_qa] before OpenAI call", flush=True)
     answer = _llm_text(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": combined_user_prompt},
         ]
     ).strip()
-    print("[node_qa] after OpenAI call", flush=True)
 
     state.setdefault("messages", []).append(
         {"role": "assistant", "content": answer, "speaker": "LLM"}
@@ -479,6 +559,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
     wiz.setdefault("ram_input_path", None)
     wiz.setdefault("classified_path", None)
+    wiz.setdefault("ram_input_ready_for_review", False)
+
     wiz.setdefault("sim_start", None)
     wiz.setdefault("sim_end", None)
     wiz.setdefault("simulations", None)
@@ -515,35 +597,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "RAM wizard cancelled/reset. You can start again by typing: create input sheet")
             return state
 
-        if cmd in {"use uploaded", "use uploaded file", "use latest upload"}:
-            latest = _latest_excel_artifact(state)
-            if not latest:
-                _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
-                return state
-            wiz["excel_path"] = latest.get("storage_key")
-            wiz["source_artifact_id"] = latest.get("id")
-            wiz["source_artifact_title"] = latest.get("title")
-            wiz["step"] = "readiness_confirm"
-            _wizard_reply(state, f"Using uploaded workbook: {wiz['source_artifact_title']}\nRunning data readiness check...")
-            try:
-                payload = check_ram_readiness(
-                    excel_path=wiz["excel_path"],
-                    machine=wiz["machine"],
-                )
-                wiz["readiness_payload"] = payload
-                _wizard_reply(
-                    state,
-                    _format_readiness_summary(payload)
-                    + "\n\nProceed with this file?\n"
-                      "- yes (continue)\n"
-                      "- use uploaded file (reselect latest upload)\n"
-                      "- cancel (stop wizard)"
-                )
-            except Exception as e:
-                wiz["step"] = "file"
-                _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}")
-            return state
-
         _wizard_reply(state, "Unknown /ram command. Use: /ram status | /ram reset | /ram cancel")
         return state
 
@@ -551,10 +604,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["active"] = True
         wiz["step"] = "machine"
         latest = _latest_excel_artifact(state)
-        extra = (
-            f"\nI can already see an uploaded workbook: {latest.get('title')}"
-            if latest else ""
-        )
+        extra = f"\nI can already see an uploaded workbook: {latest.get('title')}" if latest else ""
         _wizard_reply(
             state,
             "RAM Input Sheet Wizard started.\n"
@@ -591,24 +641,28 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     if wiz["step"] == "file":
         latest = _latest_excel_artifact(state)
 
-        if user_lower in {"use uploaded file", "use uploaded", "use latest upload", "use latest file"}:
+        if user_lower in {"proceed", "use uploaded", "continue"}:
             if not latest:
                 _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
                 return state
             wiz["excel_path"] = latest.get("storage_key")
             wiz["source_artifact_id"] = latest.get("id")
             wiz["source_artifact_title"] = latest.get("title")
+        elif user_lower in {"upload new", "new file"}:
+            _wizard_reply(state, "Okay — upload the new CMMS workbook, then type 'continue'.")
+            return state
         elif user_lower in {"pick file", "pick", "browse", "choose file", "select file"}:
             picked = _pick_excel_file_dialog()
             if not picked:
-                _wizard_reply(
-                    state,
-                    f"No file selected (cancelled). {_artifact_prompt_hint(state)}"
-                )
+                _wizard_reply(state, f"No file selected (cancelled).\n\n{_artifact_prompt_hint(state)}")
                 return state
             wiz["excel_path"] = picked
             wiz["source_artifact_id"] = None
             wiz["source_artifact_title"] = Path(picked).name
+        elif latest and user_lower == "continue":
+            wiz["excel_path"] = latest.get("storage_key")
+            wiz["source_artifact_id"] = latest.get("id")
+            wiz["source_artifact_title"] = latest.get("title")
         elif user_text_stripped:
             wiz["excel_path"] = user_text_stripped
             wiz["source_artifact_id"] = None
@@ -627,10 +681,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 machine=wiz["machine"],
             )
         except Exception as e:
-            _wizard_reply(
-                state,
-                f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}"
-            )
+            _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}")
             wiz["step"] = "file"
             return state
 
@@ -640,8 +691,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _format_readiness_summary(payload)
             + "\n\nProceed with this file?\n"
               "- yes (continue)\n"
-              "- use uploaded file (choose latest uploaded workbook)\n"
-              "- cancel (stop wizard)"
+              "- upload new (go back and upload another workbook)\n"
+              "- cancel"
         )
         wiz["step"] = "readiness_confirm"
         return state
@@ -649,16 +700,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     if wiz["step"] == "readiness_confirm":
         t = user_lower
 
-        if t in {"use uploaded file", "use uploaded", "use latest upload", "use latest file"}:
-            latest = _latest_excel_artifact(state)
-            if not latest:
-                _wizard_reply(state, "I couldn't find an uploaded Excel workbook in this conversation.")
-                return state
-            wiz["excel_path"] = latest.get("storage_key")
-            wiz["source_artifact_id"] = latest.get("id")
-            wiz["source_artifact_title"] = latest.get("title")
+        if t in {"upload new", "new file"}:
             wiz["step"] = "file"
-            _wizard_reply(state, f"Okay — switching to uploaded workbook: {wiz['source_artifact_title']}")
+            _wizard_reply(state, "Okay — upload the new CMMS workbook, then type 'continue'.")
             return state
 
         if t in {"cancel", "no", "n"}:
@@ -667,7 +711,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         if t not in {"yes", "y"}:
-            _wizard_reply(state, "Please respond with: yes | use uploaded file | cancel")
+            _wizard_reply(state, "Please respond with: yes | upload new | cancel")
             return state
 
         wiz["step"] = "categories_edit"
@@ -800,24 +844,58 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             or result.get("output_path")
             or result.get("latest_copy_path")
         )
+
         wiz["ram_input_path"] = ram_input_path
         wiz["classified_path"] = outputs.get("classified_path")
         wiz["readiness_payload"] = outputs.get("readiness")
-
-        readiness = outputs.get("readiness") or {}
-        ok_to_simulate = outputs.get("ok_to_simulate")
+        wiz["ram_input_ready_for_review"] = True
 
         _wizard_reply(
             state,
             "RAM input sheet created.\n"
             f"- source workbook: {wiz.get('source_artifact_title') or wiz.get('excel_path')}\n"
-            f"- ok_to_simulate: {ok_to_simulate}\n"
-            f"- readiness: {readiness}\n"
-            f"- RAM input path: {ram_input_path}\n"
+            f"- RAM input path: {ram_input_path}\n\n"
+            "The generated RAM input sheet is now saved as an artifact and can be downloaded.\n"
+            "Reply with:\n"
+            "- simulate (continue with this generated input sheet)\n"
+            "- upload edited (upload an edited input sheet, then type continue)"
         )
+        wiz["step"] = "input_review"
+        return state
 
+    if wiz["step"] == "input_review":
+        if user_lower in {"simulate", "run sim", "run simulation"}:
+            wiz["step"] = "sim_confirm"
+            _wizard_reply(state, "Proceed to RAM simulation using the current input sheet? (yes/no)")
+            return state
+
+        if user_lower in {"upload edited", "edited", "edit"}:
+            wiz["step"] = "awaiting_edited_input"
+            _wizard_reply(state, "Okay — upload the edited RAM input sheet, then type 'continue'.")
+            return state
+
+        _wizard_reply(state, "Reply with 'simulate' or 'upload edited'.")
+        return state
+
+    if wiz["step"] == "awaiting_edited_input":
+        if user_lower != "continue":
+            _wizard_reply(state, "Upload the edited RAM input sheet, then type 'continue'.")
+            return state
+
+        latest_uploaded = _latest_uploaded_excel_for_simulation(state, wiz.get("source_artifact_id"))
+        if not latest_uploaded:
+            _wizard_reply(state, "I could not find a newly uploaded edited input sheet in this conversation yet.")
+            return state
+
+        wiz["ram_input_path"] = latest_uploaded.get("storage_key")
+        wiz["source_artifact_id"] = latest_uploaded.get("id")
+        wiz["source_artifact_title"] = latest_uploaded.get("title")
         wiz["step"] = "sim_confirm"
-        _wizard_reply(state, "Do you want to proceed to simulate the RAM model now? (yes/no)")
+        _wizard_reply(
+            state,
+            f"Using edited uploaded input sheet: {wiz['source_artifact_title']}\n"
+            "Proceed to RAM simulation? (yes/no)"
+        )
         return state
 
     if wiz["step"] == "sim_confirm":

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -634,10 +635,33 @@ def api_list_artifacts(conversation_id: str, request: Request, browser_id: Optio
                 "mime_type": r.get("mime_type"),
                 "metadata": r.get("metadata") or {},
                 "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "download_url": f"/api/artifacts/{r['id']}/download",
             }
             for r in rows
         ]
     }
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+def api_download_artifact(artifact_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    artifact = get_artifact(artifact_id, owner_key)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+
+    storage_key = artifact.get("storage_key")
+    if not storage_key:
+        raise HTTPException(status_code=404, detail="Artifact file not found.")
+
+    path = Path(storage_key)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found.")
+
+    filename = artifact.get("title") or path.name
+    media_type = artifact.get("mime_type") or "application/octet-stream"
+    return FileResponse(path=str(path), media_type=media_type, filename=filename)
 
 
 @app.delete("/api/conversations/{conversation_id}")
@@ -705,11 +729,6 @@ def chat(req: ChatRequest, request: Request):
             conv = create_conversation(owner_key)
             conversation_id = str(conv["id"])
 
-        rows_for_debug = list_artifacts(conversation_id)
-        print(f"[chat] conversation_id={conversation_id}", flush=True)
-        print(f"[chat] artifact_count={len(rows_for_debug)}", flush=True)
-        print(f"[chat] artifact_titles={[r.get('title') for r in rows_for_debug]}", flush=True)
-
         state = SESSIONS.get(conversation_id)
         if state is None:
             saved_state = conv.get("last_state") if conv else {}
@@ -768,7 +787,6 @@ def chat(req: ChatRequest, request: Request):
             out=out,
         )
         if created_output_types:
-            print(f"[chat] persisted_generated_outputs={created_output_types}", flush=True)
             state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
 
         msgs = out.get("messages", [])

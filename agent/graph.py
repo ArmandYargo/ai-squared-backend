@@ -313,7 +313,7 @@ def node_router(state: AgentState) -> AgentState:
         return state
 
     if wiz_active:
-        state["intent"] = "qa" if _looks_like_question(t) or _is_greeting(t) else "ram_wizard"
+        state["intent"] = "ram_wizard"
         return state
 
     try:
@@ -472,6 +472,10 @@ def _wizard_reply(state: AgentState, text: str, wizard_ui: Optional[Dict[str, An
     if wizard_ui:
         msg["wizard_ui"] = wizard_ui
     state.setdefault("messages", []).append(msg)
+    wiz = state.get("ram_wizard")
+    if isinstance(wiz, dict):
+        wiz["_last_prompt"] = text
+        wiz["_last_wizard_ui"] = wizard_ui
 
 
 def _parse_date_yyyy_mm_dd(s: str):
@@ -713,6 +717,36 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     user_text = (_msgs[-1].get("content", "") if _msgs else "")
     user_text_stripped = user_text.strip()
     user_lower = user_text_stripped.lower()
+
+    if "?" in user_text_stripped and _looks_like_question(user_text_stripped):
+        print(f"[wizard] Question detected during step '{wiz.get('step')}': {user_text_stripped[:80]}", flush=True)
+        try:
+            artifact_context = (state.get("artifact_context") or "").strip()
+            rag = _retrieve_rag_context(user_text_stripped)
+            rag_context = (rag.get("context") or "").strip() if rag.get("used") else ""
+            ctx_parts: List[str] = []
+            if artifact_context:
+                ctx_parts.append(f"Document context:\n{artifact_context[:3000]}")
+            if rag_context:
+                ctx_parts.append(f"RAG context:\n{rag_context[:2000]}")
+            ctx_parts.append(f"User question:\n{user_text_stripped}")
+            answer = _llm_text([
+                {"role": "system", "content": (
+                    "You are a helpful engineering assistant. The user is in the middle of a RAM wizard workflow "
+                    "and asked a side question. Answer concisely, then they will continue with the wizard."
+                )},
+                {"role": "user", "content": "\n\n".join(ctx_parts)},
+            ]).strip()
+        except Exception as e:
+            answer = f"Sorry, I couldn't answer that right now: {type(e).__name__}: {e}"
+
+        state.setdefault("messages", []).append(
+            {"role": "assistant", "content": answer, "speaker": "LLM"}
+        )
+        last_prompt = wiz.get("_last_prompt") or "Please continue with the wizard step above."
+        last_ui = wiz.get("_last_wizard_ui")
+        _wizard_reply(state, f"Returning to the wizard (step: {wiz.get('step')}):\n\n{last_prompt}", wizard_ui=last_ui)
+        return state
 
     if wiz["step"] == "machine":
         if not user_text_stripped:

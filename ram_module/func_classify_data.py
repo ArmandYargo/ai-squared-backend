@@ -538,14 +538,30 @@ def _build_floc_code_map(
 
     code_map: Dict[str, str] = {}
     allowed = set(cats_norm) | {"other"}
-    for item in obj.get("mappings", []):
-        code = (item.get("code") or "").strip().upper()
-        raw_cat = _normalize_cat(item.get("category", ""))
-        if not code or not raw_cat:
-            continue
-        cat = _best_match_category(raw_cat, allowed)
-        if cat:
-            code_map[code] = cat
+
+    # Handle both formats: {"mappings": [{code, category}, ...]} or flat {"CODE": "cat", ...}
+    mappings_list = obj.get("mappings", [])
+    if mappings_list:
+        for item in mappings_list:
+            code = (item.get("code") or "").strip().upper()
+            raw_cat = _normalize_cat(item.get("category", ""))
+            if not code or not raw_cat:
+                continue
+            cat = _best_match_category(raw_cat, allowed)
+            if cat:
+                code_map[code] = cat
+    else:
+        # LLM returned flat dict {code: category} ignoring schema
+        for key, val in obj.items():
+            if key == "mappings":
+                continue
+            code = str(key).strip().upper()
+            raw_cat = _normalize_cat(str(val))
+            if not code or not raw_cat:
+                continue
+            cat = _best_match_category(raw_cat, allowed)
+            if cat:
+                code_map[code] = cat
     return code_map
 
 
@@ -626,19 +642,120 @@ def ai_build_category_regexes(
 
     allowed = set(cats_norm) | {"other"}
     patterns: Dict[str, "re.Pattern[str]"] = {}
-    for item in obj.get("patterns", []):
-        raw_cat = _normalize_cat(item.get("category", ""))
-        raw = (item.get("regex") or "").strip()
-        if not raw_cat or not raw or raw_cat == "other":
-            continue
-        cat = _best_match_category(raw_cat, allowed)
-        if cat == "other":
-            continue
-        try:
-            patterns[cat] = re.compile(raw, re.IGNORECASE)
-        except re.error:
-            continue
+
+    # Handle both {"patterns": [{category, regex, rationale}, ...]} or flat {cat: regex, ...}
+    patterns_list = obj.get("patterns", [])
+    if patterns_list:
+        for item in patterns_list:
+            raw_cat = _normalize_cat(item.get("category", ""))
+            raw = (item.get("regex") or "").strip()
+            if not raw_cat or not raw or raw_cat == "other":
+                continue
+            cat = _best_match_category(raw_cat, allowed)
+            if cat == "other":
+                continue
+            try:
+                patterns[cat] = re.compile(raw, re.IGNORECASE)
+            except re.error:
+                continue
+    else:
+        # LLM returned flat dict {category: regex} ignoring schema
+        for key, val in obj.items():
+            if key == "patterns":
+                continue
+            raw_cat = _normalize_cat(str(key))
+            raw = str(val).strip()
+            if not raw_cat or not raw or raw_cat == "other":
+                continue
+            cat = _best_match_category(raw_cat, allowed)
+            if cat == "other":
+                continue
+            try:
+                patterns[cat] = re.compile(raw, re.IGNORECASE)
+            except re.error:
+                continue
     return patterns
+
+
+def _build_category_failure_mode_map(
+    categories: List[str],
+    machine_hint: str,
+    *,
+    model: str = "gpt-5.2",
+) -> Dict[str, str]:
+    """
+    Ask the LLM once to map each subcomponent category to its primary failure
+    mode: Wear, Fatigue, Random, or Corrosion.
+    """
+    if not categories:
+        return {}
+
+    schema = {
+        "name": "failure_mode_mapping",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "mappings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string"},
+                            "failure_mode": {"type": "string", "enum": MECHANISM_ENUM},
+                        },
+                        "required": ["category", "failure_mode"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["mappings"],
+            "additionalProperties": False,
+        },
+    }
+
+    prompt = {
+        "role": "user",
+        "content": (
+            f"{_DOMAIN_LINE}\n"
+            f"Machine: {machine_hint}\n\n"
+            "For each equipment subcomponent category, assign the PRIMARY failure "
+            "mode that dominates in practice.  Choose EXACTLY one of:\n"
+            "  - Wear      (abrasion, friction, erosion — belts, idlers, scrapers, linings)\n"
+            "  - Fatigue   (cyclic loading, vibration cracking — shafts, pulleys, drives, gearboxes)\n"
+            "  - Corrosion (rust, oxidation, chemical attack — structures, piping, chutes exposed to moisture)\n"
+            "  - Random    (electrical faults, sensor drift, software — electrical, instrumentation, controls)\n\n"
+            f"Categories to map: {categories}\n\n"
+            "Return ONLY JSON."
+        ),
+    }
+
+    obj = _llm_json(
+        model=model,
+        messages=[{"role": "system", "content": "Return only JSON."}, prompt],
+        json_schema=schema,
+        temperature=0.0,
+        max_tokens=1000,
+    )
+
+    fm_map: Dict[str, str] = {}
+    # Handle {"mappings": [...]} or flat {cat: mode}
+    mappings_list = obj.get("mappings", [])
+    if mappings_list:
+        for item in mappings_list:
+            cat = _normalize_cat(item.get("category", ""))
+            mode = item.get("failure_mode", "Random")
+            if cat and mode in MECHANISM_ENUM:
+                fm_map[cat] = mode
+    else:
+        for key, val in obj.items():
+            if key == "mappings":
+                continue
+            cat = _normalize_cat(str(key))
+            mode = str(val)
+            if cat and mode in MECHANISM_ENUM:
+                fm_map[cat] = mode
+    return fm_map
 
 
 def classify_rows(
@@ -648,16 +765,20 @@ def classify_rows(
     floc_col: str = "functional_location",
     desc_col: str = "description",
     use_floc_fallback: bool = True,
+    category_failure_modes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, int]:
     """
     Classify every row.  Priority order:
       1. FLOC segment 6 code lookup (deterministic, most reliable)
       2. AI description regex (fallback for rows without valid FLOC)
       3. 'other' if nothing matches
+    Failure mode is assigned per-category from category_failure_modes map,
+    falling back to description keyword inference.
     Mutates work in-place.  Returns stats dict.
     """
     stats = {"floc_matched": 0, "desc_matched": 0, "other": 0}
     desc_ordered = list(desc_patterns.items())
+    cfm = category_failure_modes or {}
 
     for i in work.index:
         floc_val = str(work.at[i, floc_col])
@@ -689,13 +810,13 @@ def classify_rows(
             work.at[i, "breakdown_category"] = matched_cat
             work.at[i, "ai_confidence"] = 0.95 if "FLOC" in source else 0.80
             work.at[i, "ai_rationale"] = source
+            work.at[i, "failure_modes"] = cfm.get(matched_cat, infer_failure_mechanism(desc_val))
         else:
             work.at[i, "breakdown_category"] = "other"
             work.at[i, "ai_confidence"] = 0.0
             work.at[i, "ai_rationale"] = "no match"
+            work.at[i, "failure_modes"] = infer_failure_mechanism(desc_val)
             stats["other"] += 1
-
-        work.at[i, "failure_modes"] = infer_failure_mechanism(desc_val)
 
     return stats
 
@@ -791,11 +912,17 @@ def step4_process(
         model=model,
     )
 
+    # Map categories to primary failure modes (1 LLM call)
+    category_fm = _build_category_failure_mode_map(
+        preferred or [], machine_hint or "", model=model,
+    )
+
     # Classify: FLOC segment 6 first (deterministic), description regex as fallback
     stats = classify_rows(
         work, floc_code_map, desc_patterns,
         floc_col="functional_location", desc_col="description",
         use_floc_fallback=USE_FLOC_FALLBACK,
+        category_failure_modes=category_fm,
     )
 
     # Final safety: mechanism enum always valid

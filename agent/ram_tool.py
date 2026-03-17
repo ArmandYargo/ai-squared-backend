@@ -34,7 +34,10 @@ def _safe_slug(s: str) -> str:
 
 
 def _log(msg: str):
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode("utf-8", errors="replace").decode("ascii", errors="replace"), flush=True)
 
 
 def check_ram_readiness(
@@ -269,14 +272,14 @@ def run_ram_pipeline(
     latest_path = outputs_dir / latest_name
 
     log("=== RAM/Inputsheet pipeline started ===")
-    log(f"✅ File selected: {excel_name}")
+    log(f"[OK] File selected: {excel_name}")
 
     # Step 2/7: ingest workbook
     _emit("ingest", "Step 2/7: Ingesting workbook and mapping columns...", est_seconds=45)
     log("Step 2/7: Ingest workbook + decide column mapping…")
     df_master, report = ingest_cmms_workbook(excel_path, model=model, min_coverage=min_coverage)
     mapping = report["mapping"]
-    log("✅ Ingest complete.")
+    log("[OK] Ingest complete.")
 
     # Step 3/7: readiness check
     _emit("readiness", "Step 3/7: Assessing data readiness...", est_seconds=35)
@@ -290,15 +293,15 @@ def run_ram_pipeline(
         match_scope=match_scope,
     )
     ok_to_simulate = bool(readiness.get("ok_to_simulate", False))
-    log(f"✅ Readiness check complete. OK to simulate?: {ok_to_simulate}")
+    log(f"[OK] Readiness check complete. OK to simulate?: {ok_to_simulate}")
 
     # Step 4/7: apply date filter
     _emit("date_filter", "Step 4/7: Applying date filter...", est_seconds=30)
     log(f"Step 4/7: Apply date filter: {date_range_text or '(none)'}")
     df_filtered, date_meta = _apply_date_filter(df_subset, mapping, date_range_text)
     if date_meta.get("skipped"):
-        log(f"ℹ️ Date filter skipped: {date_meta.get('reason')}")
-    log(f"✅ Rows after filter: {len(df_filtered)}")
+        log(f"[INFO] Date filter skipped: {date_meta.get('reason')}")
+    log(f"[OK] Rows after filter: {len(df_filtered)}")
 
     # Step 5/7: categories
     _emit("categories", "Step 5/7: Preparing breakdown categories...", est_seconds=25)
@@ -307,7 +310,7 @@ def run_ram_pipeline(
         preferred_categories = ai_propose_components_coarse(machine, model=model)
         if category_edit_text:
             preferred_categories = ai_apply_edit_to_components(preferred_categories, category_edit_text, model=model)
-    log(f"✅ Categories set ({len(preferred_categories)}): {preferred_categories}")
+    log(f"[OK] Categories set ({len(preferred_categories)}): {preferred_categories}")
 
     # Step 6/7: classify
     _SECS_PER_ROW = 2.3
@@ -336,7 +339,7 @@ def run_ram_pipeline(
     _cls_err = ((_est_secs - _cls_elapsed) / _cls_elapsed * 100) if _cls_elapsed > 0 else 0
     _cls_sign = "+" if _cls_err >= 0 else ""
     log(
-        f"✅ Classification complete. Rows classified: {len(classified_df)} | "
+        f"[OK] Classification complete. Rows classified: {len(classified_df)} | "
         f"Time: {_cls_elapsed:.1f}s | Prediction error: {_cls_sign}{_cls_err:.1f}%"
     )
 
@@ -344,7 +347,7 @@ def run_ram_pipeline(
     log("Writing classified workbook…")
     with pd.ExcelWriter(classified_path, engine="openpyxl") as writer:
         classified_df.to_excel(writer, sheet_name="classified", index=False)
-    log(f"✅ Classified workbook written: {classified_path}")
+    log(f"[OK] Classified workbook written: {classified_path}")
 
     # Build summary + append into the SAME workbook (correct signature)
     log("Building breakdown summary…")
@@ -358,7 +361,7 @@ def run_ram_pipeline(
         days_in_range=days_in_range,
         model=model,
     )
-    log("✅ Summary complete.")
+    log("[OK] Summary complete.")
 
     # Best-effort: stamp the date range using your existing helper (if it works)
     try:
@@ -371,7 +374,7 @@ def run_ram_pipeline(
             model=model,
             match_scope=match_scope,
         )
-        log("✅ Date range stamped into workbook.")
+        log("[OK] Date range stamped into workbook.")
     except Exception:
         # Don’t fail the pipeline if stamping fails
         pass
@@ -398,18 +401,18 @@ def run_ram_pipeline(
 
     if not input_path.exists():
         raise RuntimeError(f"Input workbook was not saved: {input_path}")
-    log(f"✅ Input workbook written: {input_path}")
+    log(f"[OK] Input workbook written: {input_path}")
 
     # Latest copy (always points to the most recent run)
     shutil.copyfile(input_path, latest_path)
-    log(f"✅ Latest copy written: {latest_path}")
+    log(f"[OK] Latest copy written: {latest_path}")
 
     # Timestamped backup so previous runs are preserved for inspection
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_name = f"ram_input_sheet_{ts}.xlsx"
     backup_path = outputs_dir / backup_name
     shutil.copyfile(input_path, backup_path)
-    log(f"✅ Backup saved: {backup_path}")
+    log(f"[OK] Backup saved: {backup_path}")
 
     log("=== RAM/Inputsheet pipeline finished ===")
 

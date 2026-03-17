@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -764,6 +764,60 @@ def api_download_artifact(artifact_id: str, request: Request, browser_id: Option
     filename = artifact.get("title") or path.name
     media_type = artifact.get("mime_type") or "application/octet-stream"
     return FileResponse(path=str(path), media_type=media_type, filename=filename)
+
+
+@app.get("/api/conversations/{conversation_id}/artifacts/download-all")
+def api_download_all_artifacts(conversation_id: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    owner_key = _resolve_owner_key(browser_id)
+    conv = get_conversation(conversation_id, owner_key)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    rows = list_artifacts(conversation_id)
+    available_files: List[Tuple[str, Path]] = []
+    for r in rows:
+        sk = r.get("storage_key")
+        if sk:
+            p = Path(sk)
+            if p.exists() and p.is_file():
+                display_name = r.get("title") or p.name
+                available_files.append((display_name, p))
+
+    if not available_files:
+        raise HTTPException(
+            status_code=410,
+            detail="No artifact files are currently available. "
+                   "Render's free tier uses ephemeral storage — files are lost when the instance restarts.",
+        )
+
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    seen_names: Dict[str, int] = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for display_name, file_path in available_files:
+            name = display_name
+            if name in seen_names:
+                seen_names[name] += 1
+                stem = Path(name).stem
+                suffix = Path(name).suffix
+                name = f"{stem}_{seen_names[name]}{suffix}"
+            else:
+                seen_names[name] = 0
+            zf.write(str(file_path), arcname=name)
+
+    buf.seek(0)
+    title = (conv.get("title") or "artifacts").replace(" ", "_")[:40]
+    zip_filename = f"{title}_{conversation_id[:8]}.zip"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+    )
 
 
 @app.delete("/api/conversations/{conversation_id}")

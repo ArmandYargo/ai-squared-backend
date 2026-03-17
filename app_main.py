@@ -1080,6 +1080,159 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+VALID_PLOT_TYPES = {
+    "availability",
+    "failures",
+    "costs_by_component",
+    "costs_over_time",
+    "downtime_by_component",
+    "downtime_over_time",
+}
+
+
+def _read_sim_dataframe(file_path: str) -> Any:
+    """Read a parquet or csv file into a pandas DataFrame."""
+    import pandas as pd  # noqa: F811
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Data file no longer available: {p.name}")
+    if p.suffix.lower() == ".parquet":
+        return pd.read_parquet(str(p))
+    return pd.read_csv(str(p))
+
+
+def _build_chart_data(plot_type: str, sim_outputs: Dict[str, str]) -> Dict[str, Any]:
+    """Read archived simulation output files and compute chart-ready JSON."""
+    import pandas as pd
+
+    monthly_path = sim_outputs.get("monthly_component")
+    yearly_sub_path = sim_outputs.get("yearly_subcomponent")
+
+    if plot_type == "availability":
+        if not monthly_path:
+            raise ValueError("monthly_component output not found in simulation archive.")
+        df = _read_sim_dataframe(monthly_path)
+        avail = df.groupby("year_month")["availability"].mean() * 100
+        return {
+            "chart_type": "line",
+            "title": "System Monthly Availability",
+            "x_label": "Period",
+            "y_label": "Availability (%)",
+            "labels": avail.index.tolist(),
+            "datasets": [{"label": "Availability (%)", "data": [round(v, 2) for v in avail.values.tolist()]}],
+        }
+
+    if plot_type == "failures":
+        path = yearly_sub_path or sim_outputs.get("yearly_component")
+        if not path:
+            raise ValueError("yearly_subcomponent output not found in simulation archive.")
+        df = _read_sim_dataframe(path)
+        group_col = "subcomponent_desc" if "subcomponent_desc" in df.columns else "component_desc" if "component_desc" in df.columns else "component"
+        event_data = df.groupby(group_col)["failures"].mean()
+        return {
+            "chart_type": "bar",
+            "title": "Average Yearly Failures by Component",
+            "x_label": "Component",
+            "y_label": "Average Failures",
+            "labels": event_data.index.tolist(),
+            "datasets": [{"label": "Failures", "data": [round(v, 2) for v in event_data.values.tolist()]}],
+        }
+
+    if plot_type == "costs_by_component":
+        path = yearly_sub_path or sim_outputs.get("yearly_component")
+        if not path:
+            raise ValueError("yearly_subcomponent output not found in simulation archive.")
+        df = _read_sim_dataframe(path)
+        group_col = "subcomponent_desc" if "subcomponent_desc" in df.columns else "component_desc" if "component_desc" in df.columns else "component"
+        cost_data = df.groupby(group_col)["cost"].mean()
+        return {
+            "chart_type": "bar",
+            "title": "Average Yearly Maintenance Cost by Component",
+            "x_label": "Component",
+            "y_label": "Average Cost ($)",
+            "labels": cost_data.index.tolist(),
+            "datasets": [{"label": "Cost ($)", "data": [round(v, 2) for v in cost_data.values.tolist()]}],
+        }
+
+    if plot_type == "costs_over_time":
+        if not monthly_path:
+            raise ValueError("monthly_component output not found in simulation archive.")
+        df = _read_sim_dataframe(monthly_path)
+        cost_data = df.groupby("year_month")["cost"].sum()
+        return {
+            "chart_type": "line",
+            "title": "Monthly Maintenance Cost Over Time",
+            "x_label": "Period",
+            "y_label": "Cost ($)",
+            "labels": cost_data.index.tolist(),
+            "datasets": [{"label": "Cost ($)", "data": [round(v, 2) for v in cost_data.values.tolist()]}],
+        }
+
+    if plot_type == "downtime_by_component":
+        path = yearly_sub_path or sim_outputs.get("yearly_component")
+        if not path:
+            raise ValueError("yearly_subcomponent output not found in simulation archive.")
+        df = _read_sim_dataframe(path)
+        group_col = "subcomponent_desc" if "subcomponent_desc" in df.columns else "component_desc" if "component_desc" in df.columns else "component"
+        dt_data = df.groupby(group_col)["downtime"].mean() * 24
+        return {
+            "chart_type": "bar",
+            "title": "Average Yearly Downtime by Component",
+            "x_label": "Component",
+            "y_label": "Average Downtime (Hours)",
+            "labels": dt_data.index.tolist(),
+            "datasets": [{"label": "Downtime (hrs)", "data": [round(v, 2) for v in dt_data.values.tolist()]}],
+        }
+
+    if plot_type == "downtime_over_time":
+        if not monthly_path:
+            raise ValueError("monthly_component output not found in simulation archive.")
+        df = _read_sim_dataframe(monthly_path)
+        dt_data = df.groupby("year_month")["downtime"].sum() * 24
+        return {
+            "chart_type": "line",
+            "title": "Monthly Total Downtime Over Time",
+            "x_label": "Period",
+            "y_label": "Downtime (Hours)",
+            "labels": dt_data.index.tolist(),
+            "datasets": [{"label": "Downtime (hrs)", "data": [round(v, 2) for v in dt_data.values.tolist()]}],
+        }
+
+    raise ValueError(f"Unknown plot type: {plot_type}")
+
+
+@app.get("/api/plots/{conversation_id}/{plot_type}")
+async def api_get_plot_data(conversation_id: str, plot_type: str, request: Request, browser_id: Optional[str] = None):
+    _require_auth(request)
+
+    if plot_type not in VALID_PLOT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid plot type '{plot_type}'. Valid: {sorted(VALID_PLOT_TYPES)}")
+
+    owner_key = _resolve_owner_key(browser_id)
+    conv = get_conversation(conversation_id, owner_key)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    last_state = conv.get("last_state") or {}
+    wiz = last_state.get("ram_wizard") or {}
+    sim_outputs = wiz.get("sim_outputs") or {}
+
+    if not sim_outputs:
+        raise HTTPException(status_code=404, detail="No simulation outputs found for this conversation.")
+
+    try:
+        chart_data = _build_chart_data(plot_type, sim_outputs)
+        return chart_data
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=410,
+            detail="Simulation data files are no longer available. Render's free tier uses ephemeral storage — "
+                   "files are lost when the instance restarts.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating plot data: {type(e).__name__}: {e}")
+
+
 @app.get("/api/progress/{conversation_id}")
 async def get_progress(conversation_id: str, request: Request):
     _require_auth(request)

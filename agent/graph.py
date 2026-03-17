@@ -1133,8 +1133,14 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
     if wiz["step"] == "input_review":
         if user_lower in {"simulate", "run sim", "run simulation"}:
-            wiz["step"] = "sim_confirm"
-            _wizard_reply(state, "Proceed to RAM simulation using the current input sheet? (yes/no)")
+            d0, d1 = _default_dates_from_input_sheet(wiz.get("ram_input_path") or "") if wiz.get("ram_input_path") else (None, None)
+            wiz["_sim_default_start"] = str(d0) if d0 else None
+            wiz["_sim_default_end"] = str(d1) if d1 else None
+            if d0:
+                _wizard_reply(state, f"Enter simulation START date (YYYY-MM-DD). Default: {d0} (type 'default')")
+            else:
+                _wizard_reply(state, "Enter simulation START date (YYYY-MM-DD).")
+            wiz["step"] = "sim_start"
             return state
 
         if user_lower in {"view & edit", "view and edit", "edit", "view", "review"}:
@@ -1189,11 +1195,14 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 )
                 return state
 
-            wiz["step"] = "sim_confirm"
+            wiz["step"] = "input_review"
             _wizard_reply(
                 state,
-                "Input sheet updated successfully.\n"
-                "Proceed to RAM simulation? (yes/no)"
+                "Input sheet updated successfully.\n\n"
+                "Reply with:\n"
+                "- simulate (continue with this input sheet)\n"
+                "- edit (make more changes)\n"
+                "- upload (use a different input sheet)"
             )
             return state
 
@@ -1352,16 +1361,29 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
         period_days = (end - start).days
         period_str = f"{period_days} days (~{period_days // 365} years)"
+
+        available_plots = [
+            {"id": "availability", "label": "Availability", "description": "System availability % over time"},
+            {"id": "failures", "label": "Failures", "description": "Average yearly failures by component"},
+            {"id": "costs_by_component", "label": "Costs by Component", "description": "Average yearly maintenance cost by component"},
+            {"id": "costs_over_time", "label": "Costs over Time", "description": "Monthly maintenance cost over time"},
+            {"id": "downtime_by_component", "label": "Downtime by Component", "description": "Average yearly downtime by component"},
+            {"id": "downtime_over_time", "label": "Downtime over Time", "description": "Monthly total downtime over time"},
+        ]
+
         _wizard_reply(
             state,
             "Simulation complete.\n"
             f"- simulations: {sims}\n"
             f"- period: {start} to {end} ({period_str})\n"
             f"- total time: {_sim_wall_elapsed:.1f}s\n"
-            f"- archived run dir: {archive.run_dir}\n"
-            f"- metadata: {archive.metadata_path}\n"
             f"- saved outputs: {archive.summary.get('saved_outputs_count')}\n"
-            f"- saved condition tables: {archive.summary.get('saved_conditions_count')}\n"
+            f"- saved condition tables: {archive.summary.get('saved_conditions_count')}\n\n"
+            "Select a plot below to visualise the results.",
+            wizard_ui={
+                "type": "sim_plots_menu",
+                "plots": available_plots,
+            },
         )
         return state
 

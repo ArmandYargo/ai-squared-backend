@@ -98,9 +98,11 @@ def ai_apply_edit_to_components(
         "Support multiple languages (English, Afrikaans, etc.) - treat words like 'expand', 'verbreed', "
         "'break down', 'uitbrei' as meaning the same thing."
     )
+    numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(current))
     usr = (
-        f"Current list: {json.dumps(current, ensure_ascii=False)}\n"
-        f"User message: {user_message}\n"
+        f"Current list (numbered 1-based):\n{numbered}\n\n"
+        f"User message: {user_message}\n\n"
+        "IMPORTANT: Numbers in the user message refer to the 1-based numbering above.\n"
         "Return ONLY JSON with 'final' (array of strings). Keep snake_case; no duplicates.\n"
         "Remember: when expanding a category, REPLACE it with its subcategories (don't keep both)."
     )

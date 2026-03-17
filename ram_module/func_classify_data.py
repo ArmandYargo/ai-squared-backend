@@ -406,8 +406,29 @@ def _validate_item(
 
 
 # =============================================================================
-# Two-signal classification: FLOC code (primary) + description regex (secondary)
+# Classification: FLOC position-based (primary) + AI description regex (secondary)
 # =============================================================================
+
+# ---- Toggle: set to False to skip FLOC-based classification ----
+USE_FLOC_FALLBACK = True
+
+# SAP FLOC structure (each segment is 3 chars, dash-separated):
+#   0: Entity  1: Plant  2: Area  3: Section  4: MachineType  5: MachineNo
+#   6: EquipCategory  7+: SubCategory / Instance
+# Example: ECG-P02-579-CRP-CNV-080-ELE-PNL-001
+#          segment 4 = CNV (conveyor), segment 6 = ELE (electrical)
+_FLOC_CATEGORY_SEGMENT = 6
+
+
+def _floc_extract_category_code(floc: str) -> Optional[str]:
+    """Extract the equipment category code from FLOC segment 6 (chars 25-27)."""
+    parts = floc.split("-")
+    if len(parts) > _FLOC_CATEGORY_SEGMENT:
+        code = parts[_FLOC_CATEGORY_SEGMENT].strip().upper()
+        if code.isalpha() and 2 <= len(code) <= 4:
+            return code
+    return None
+
 
 def _build_floc_code_map(
     floc_series: pd.Series,
@@ -417,23 +438,19 @@ def _build_floc_code_map(
     model: str = "gpt-5.2",
 ) -> Dict[str, str]:
     """
-    Extract unique FLOC type-codes and ask the LLM to map each code to a
-    category.  FLOC codes like 'BET-001', 'ELE-PNL-001', 'CHU-001' are the
-    primary signal for classification.
-    Returns {code_prefix: category}, e.g. {'BET': 'belt', 'ELE': 'electrical'}.
+    Extract unique equipment category codes from FLOC segment 6 and ask the
+    LLM to map each to the nearest user-defined category.
+    Returns e.g. {'BET': 'belt', 'ELE': 'electrical', 'CHU': 'chute', ...}.
     """
     raw_flocs = floc_series.dropna().astype(str).unique().tolist()
 
-    # Extract all 2-4 letter uppercase alpha segments from FLOCs.
-    # These contain equipment type codes (BET, ELE, CHU, IDL, PNL, etc.)
-    alpha_segments: set = set()
+    codes: set = set()
     for f in raw_flocs:
-        for part in f.split("-"):
-            cleaned = part.strip().upper()
-            if cleaned.isalpha() and 2 <= len(cleaned) <= 4:
-                alpha_segments.add(cleaned)
+        code = _floc_extract_category_code(f)
+        if code:
+            codes.add(code)
 
-    unique_codes = sorted(alpha_segments)[:60]
+    unique_codes = sorted(codes)
     if not unique_codes:
         return {}
 
@@ -467,19 +484,16 @@ def _build_floc_code_map(
         "role": "user",
         "content": (
             f"{_DOMAIN_LINE}\n"
-            "I have short alpha codes extracted from SAP Functional Location (FLOC) strings.  "
-            "These codes identify equipment types.  Map each EQUIPMENT code to the BEST "
-            "matching breakdown category.  Codes that are NOT equipment identifiers "
-            "(e.g., plant/area/section codes like ECG, CRP, CNV, PHP, SKP, LDP, SRP, WHP, CNP) "
-            "should be mapped to 'other'.\n\n"
+            "I have SAP equipment category codes extracted from Functional Location segment 6.  "
+            "Map each code to the BEST matching breakdown category.\n\n"
             "Common SAP equipment type codes:\n"
             "- BET = belt, PUL = pulley, IDL = idler, DRV = drive, CPL = coupling\n"
-            "- ELE/ELC = electrical, PNL = panel, SWH = switch, MOT = motor\n"
+            "- ELE = electrical (includes panels, switches, motors)\n"
             "- CHU = chute, SCA = scraper, STR/STL = structure\n"
-            "- INE/INS = instrumentation, TSM = transmitter, DTE = detector, MET = meter, WGR = weigher\n"
+            "- INE/INS = instrumentation (includes transmitters, detectors, meters, weighers)\n"
             "- HYD = hydraulic, VLV = valve, GBX = gearbox\n"
-            "- PWR/POW = power_supply, SAP = (system code, use other)\n"
-            "- PIP = piping/structure\n\n"
+            "- PWR/POW = power_supply, PIP = piping/structure\n\n"
+            "If a code does not fit any category, map it to 'other'.\n\n"
             f"Machine: {machine_hint}\n"
             f"Categories: {cats_norm}\n"
             f"Codes to map: {unique_codes}\n\n"
@@ -498,10 +512,10 @@ def _build_floc_code_map(
     code_map: Dict[str, str] = {}
     allowed = set(cats_norm) | {"other"}
     for item in obj.get("mappings", []):
-        code = (item.get("code") or "").strip()
+        code = (item.get("code") or "").strip().upper()
         cat = _normalize_cat(item.get("category", ""))
         if code and cat and cat in allowed:
-            code_map[code.upper()] = cat
+            code_map[code] = cat
     return code_map
 
 
@@ -514,8 +528,7 @@ def ai_build_category_regexes(
 ) -> Dict[str, "re.Pattern[str]"]:
     """
     Ask the LLM once to produce a regex for each category based on sample
-    descriptions.  Returns {category: compiled_regex}.  Used as a secondary
-    classifier when the FLOC code doesn't resolve a category.
+    descriptions.  Used as a secondary classifier when FLOC code is unavailable.
     """
     unique_descs = list(dict.fromkeys(d.strip() for d in descriptions if d.strip()))
     sample = unique_descs[:150]
@@ -561,11 +574,7 @@ def ai_build_category_regexes(
             "- Study the sample descriptions carefully.\n"
             "- Be BROAD: use alternation (|) generously for synonyms, abbreviations, "
             "common misspellings, partial words.\n"
-            "- Keywords to look for: part names (belt, roller, idler, pulley, chute, motor, "
-            "scraper, gearbox), actions (tear, broken, worn, skew, alignment, sparks, noise), "
-            "sensor/electrical terms (underspeed, blockchute, alarm, fault, trip, interlock, "
-            "sima code, pullwire, retain).\n"
-            "- Do NOT use look-aheads/look-behinds. Use \\b for word boundaries where helpful.\n"
+            "- Do NOT use look-aheads/look-behinds.\n"
             "- Do NOT include an 'other' category.\n\n"
             f"Machine scope: {machine_hint}\n"
             f"Categories (snake_case): {cats_norm}\n\n"
@@ -596,44 +605,47 @@ def ai_build_category_regexes(
     return patterns
 
 
-def classify_two_signal(
+def classify_rows(
     work: pd.DataFrame,
     floc_code_map: Dict[str, str],
     desc_patterns: Dict[str, "re.Pattern[str]"],
     floc_col: str = "functional_location",
     desc_col: str = "description",
+    use_floc_fallback: bool = True,
 ) -> Dict[str, int]:
     """
-    Classify every row using two signals:
-      1. FLOC type-code (primary, high confidence)
-      2. Description regex (secondary, lower confidence)
+    Classify every row.  Priority order:
+      1. FLOC segment 6 code lookup (deterministic, most reliable)
+      2. AI description regex (fallback for rows without valid FLOC)
+      3. 'other' if nothing matches
     Mutates work in-place.  Returns stats dict.
     """
     stats = {"floc_matched": 0, "desc_matched": 0, "other": 0}
     desc_ordered = list(desc_patterns.items())
 
     for i in work.index:
-        floc_val = str(work.at[i, floc_col]).upper()
+        floc_val = str(work.at[i, floc_col])
         desc_val = str(work.at[i, desc_col])
 
         matched_cat = None
         source = ""
 
-        for code, cat in floc_code_map.items():
-            if cat == "other":
-                continue
-            # Match as a FLOC segment: surrounded by dashes (or at start/end)
-            if f"-{code.upper()}-" in f"-{floc_val}-":
-                matched_cat = cat
-                source = f"FLOC code '{code}'"
-                stats["floc_matched"] += 1
-                break
+        # Try 1: FLOC segment 6 deterministic lookup (primary)
+        if use_floc_fallback:
+            code = _floc_extract_category_code(floc_val)
+            if code and code in floc_code_map:
+                cat = floc_code_map[code]
+                if cat != "other":
+                    matched_cat = cat
+                    source = f"FLOC segment 6: '{code}'"
+                    stats["floc_matched"] += 1
 
+        # Try 2: AI description regex (fallback)
         if not matched_cat:
             for cat, pat in desc_ordered:
                 if pat.search(desc_val):
                     matched_cat = cat
-                    source = f"description regex: /{pat.pattern}/"
+                    source = f"description regex: /{pat.pattern[:60]}/"
                     stats["desc_matched"] += 1
                     break
 
@@ -644,7 +656,7 @@ def classify_two_signal(
         else:
             work.at[i, "breakdown_category"] = "other"
             work.at[i, "ai_confidence"] = 0.0
-            work.at[i, "ai_rationale"] = "no FLOC code or description match"
+            work.at[i, "ai_rationale"] = "no match"
             stats["other"] += 1
 
         work.at[i, "failure_modes"] = infer_failure_mechanism(desc_val)
@@ -726,7 +738,7 @@ def step4_process(
 
     mapping_out: Dict[str, Optional[str]] = {"functional_location": floc_col, "description": desc_col, "duration": used_col}
 
-    # Signal 1: map FLOC type-codes to categories (1 LLM call)
+    # Signal 1: map FLOC segment-6 codes to categories (1 LLM call)
     floc_code_map = _build_floc_code_map(
         work["functional_location"],
         preferred or [],
@@ -743,10 +755,11 @@ def step4_process(
         model=model,
     )
 
-    # Apply both signals: FLOC first, description fallback
-    stats = classify_two_signal(
+    # Classify: FLOC segment 6 first (deterministic), description regex as fallback
+    stats = classify_rows(
         work, floc_code_map, desc_patterns,
         floc_col="functional_location", desc_col="description",
+        use_floc_fallback=USE_FLOC_FALLBACK,
     )
 
     # Final safety: mechanism enum always valid

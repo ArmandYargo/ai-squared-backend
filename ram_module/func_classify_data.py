@@ -430,6 +430,31 @@ def _floc_extract_category_code(floc: str) -> Optional[str]:
     return None
 
 
+def _best_match_category(llm_cat: str, allowed: set) -> str:
+    """
+    Find the closest allowed category for a LLM-returned category name.
+    Tries: exact, substring containment, then longest common prefix.
+    Returns 'other' if no reasonable match.
+    """
+    if llm_cat in allowed:
+        return llm_cat
+    if not llm_cat or llm_cat == "other":
+        return "other"
+    real = allowed - {"other"}
+    # substring: llm_cat is a prefix/substring of an allowed category
+    for a in real:
+        if llm_cat in a or a in llm_cat:
+            return a
+    # token overlap (split on '_')
+    llm_tokens = set(llm_cat.split("_"))
+    best, best_score = "other", 0
+    for a in real:
+        overlap = len(llm_tokens & set(a.split("_")))
+        if overlap > best_score:
+            best, best_score = a, overlap
+    return best if best_score > 0 else "other"
+
+
 def _build_floc_code_map(
     floc_series: pd.Series,
     categories: List[str],
@@ -440,7 +465,7 @@ def _build_floc_code_map(
     """
     Extract unique equipment category codes from FLOC segment 6 and ask the
     LLM to map each to the nearest user-defined category.
-    Returns e.g. {'BET': 'belt', 'ELE': 'electrical', 'CHU': 'chute', ...}.
+    Returns e.g. {'BET': 'belt', 'ELE': 'electrical_control', ...}.
     """
     raw_flocs = floc_series.dropna().astype(str).unique().tolist()
 
@@ -486,6 +511,10 @@ def _build_floc_code_map(
             f"{_DOMAIN_LINE}\n"
             "I have SAP equipment category codes extracted from Functional Location segment 6.  "
             "Map each code to the BEST matching breakdown category.\n\n"
+            "IMPORTANT: You MUST return one of these EXACT category names "
+            "(copy-paste the string exactly):\n"
+            + "\n".join(f"  - {c}" for c in cats_norm)
+            + "\n  - other  (only if no category fits)\n\n"
             "Common SAP equipment type codes:\n"
             "- BET = belt, PUL = pulley, IDL = idler, DRV = drive, CPL = coupling\n"
             "- ELE = electrical (includes panels, switches, motors)\n"
@@ -493,9 +522,7 @@ def _build_floc_code_map(
             "- INE/INS = instrumentation (includes transmitters, detectors, meters, weighers)\n"
             "- HYD = hydraulic, VLV = valve, GBX = gearbox\n"
             "- PWR/POW = power_supply, PIP = piping/structure\n\n"
-            "If a code does not fit any category, map it to 'other'.\n\n"
             f"Machine: {machine_hint}\n"
-            f"Categories: {cats_norm}\n"
             f"Codes to map: {unique_codes}\n\n"
             "Return ONLY JSON."
         ),
@@ -513,8 +540,11 @@ def _build_floc_code_map(
     allowed = set(cats_norm) | {"other"}
     for item in obj.get("mappings", []):
         code = (item.get("code") or "").strip().upper()
-        cat = _normalize_cat(item.get("category", ""))
-        if code and cat and cat in allowed:
+        raw_cat = _normalize_cat(item.get("category", ""))
+        if not code or not raw_cat:
+            continue
+        cat = _best_match_category(raw_cat, allowed)
+        if cat:
             code_map[code] = cat
     return code_map
 
@@ -570,14 +600,16 @@ def ai_build_category_regexes(
             "semi-literate operators — expect abbreviations, misspellings, and shorthand).  "
             "For EACH breakdown category, write a Python case-insensitive regex that matches "
             "descriptions belonging to that category.\n\n"
+            "IMPORTANT: Use these EXACT category names (copy-paste):\n"
+            + "\n".join(f"  - {c}" for c in cats_norm)
+            + "\n\n"
             "Rules:\n"
             "- Study the sample descriptions carefully.\n"
             "- Be BROAD: use alternation (|) generously for synonyms, abbreviations, "
             "common misspellings, partial words.\n"
             "- Do NOT use look-aheads/look-behinds.\n"
             "- Do NOT include an 'other' category.\n\n"
-            f"Machine scope: {machine_hint}\n"
-            f"Categories (snake_case): {cats_norm}\n\n"
+            f"Machine scope: {machine_hint}\n\n"
             f"Sample descriptions ({len(sample)} of {len(unique_descs)} unique):\n"
             + "\n".join(f"  - {d}" for d in sample)
             + "\n\nReturn ONLY JSON."
@@ -592,11 +624,15 @@ def ai_build_category_regexes(
         max_tokens=3500,
     )
 
+    allowed = set(cats_norm) | {"other"}
     patterns: Dict[str, "re.Pattern[str]"] = {}
     for item in obj.get("patterns", []):
-        cat = _normalize_cat(item.get("category", ""))
+        raw_cat = _normalize_cat(item.get("category", ""))
         raw = (item.get("regex") or "").strip()
-        if not cat or not raw or cat == "other":
+        if not raw_cat or not raw or raw_cat == "other":
+            continue
+        cat = _best_match_category(raw_cat, allowed)
+        if cat == "other":
             continue
         try:
             patterns[cat] = re.compile(raw, re.IGNORECASE)

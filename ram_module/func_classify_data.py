@@ -406,6 +406,137 @@ def _validate_item(
 
 
 # =============================================================================
+# Regex-based classification (single LLM call + deterministic apply)
+# =============================================================================
+
+def ai_build_category_regexes(
+    descriptions: List[str],
+    categories: List[str],
+    machine_hint: str,
+    *,
+    model: str = "gpt-5.2",
+) -> Dict[str, "re.Pattern[str]"]:
+    """
+    Ask the LLM once to produce a regex for each category based on sample
+    descriptions.  Returns {category: compiled_regex}.
+    """
+    unique_descs = list(dict.fromkeys(d.strip() for d in descriptions if d.strip()))
+    sample = unique_descs[:150]
+
+    cats_norm = [_normalize_cat(c) for c in categories if _normalize_cat(c)]
+    if not cats_norm:
+        return {}
+
+    schema = {
+        "name": "category_regexes",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "patterns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string"},
+                            "regex": {"type": "string"},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["category", "regex", "rationale"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["patterns"],
+            "additionalProperties": False,
+        },
+    }
+
+    prompt = {
+        "role": "user",
+        "content": (
+            f"{_DOMAIN_LINE}\n"
+            "I have a list of maintenance work-order descriptions for a machine and a set of "
+            "coarse breakdown CATEGORIES.  For EACH category, write a single Python-compatible "
+            "case-insensitive regex that matches descriptions belonging to that category.\n\n"
+            "Rules:\n"
+            "- Study the sample descriptions carefully — look for keywords, part names, "
+            "abbreviations, and patterns that distinguish each category.\n"
+            "- Each regex should be broad enough to capture variations (plurals, abbreviations, "
+            "misspellings) but specific enough to avoid false positives.\n"
+            "- Use alternation (|) generously.  Do NOT use look-aheads/look-behinds.\n"
+            "- A description may match multiple categories; the first match wins, so order "
+            "the most specific categories first.\n"
+            "- Do NOT include an 'other' category — unmatched rows are automatically 'other'.\n\n"
+            f"Machine scope: {machine_hint}\n"
+            f"Categories (snake_case): {cats_norm}\n\n"
+            f"Sample descriptions ({len(sample)} of {len(unique_descs)} unique):\n"
+            + "\n".join(f"  - {d}" for d in sample)
+            + "\n\nReturn ONLY JSON."
+        ),
+    }
+
+    obj = _llm_json(
+        model=model,
+        messages=[{"role": "system", "content": "Return only JSON."}, prompt],
+        json_schema=schema,
+        temperature=0.0,
+        max_tokens=2000,
+    )
+
+    patterns: Dict[str, "re.Pattern[str]"] = {}
+    for item in obj.get("patterns", []):
+        cat = _normalize_cat(item.get("category", ""))
+        raw = (item.get("regex") or "").strip()
+        if not cat or not raw or cat == "other":
+            continue
+        try:
+            patterns[cat] = re.compile(raw, re.IGNORECASE)
+        except re.error:
+            continue
+    return patterns
+
+
+def classify_by_regex(
+    work: pd.DataFrame,
+    category_patterns: Dict[str, "re.Pattern[str]"],
+    desc_col: str = "description",
+) -> Dict[str, int]:
+    """
+    Apply pre-built category regexes to every row in *work*.
+    Mutates work in-place (breakdown_category, failure_modes, ai_confidence,
+    ai_rationale).  Returns stats dict.
+    """
+    stats = {"regex_matched": 0, "other": 0}
+    ordered = list(category_patterns.items())
+
+    for i in work.index:
+        text = str(work.at[i, desc_col])
+        matched_cat = None
+        matched_pat = ""
+        for cat, pat in ordered:
+            if pat.search(text):
+                matched_cat = cat
+                matched_pat = pat.pattern
+                break
+
+        if matched_cat:
+            work.at[i, "breakdown_category"] = matched_cat
+            work.at[i, "ai_confidence"] = 0.90
+            work.at[i, "ai_rationale"] = f"regex match: /{matched_pat}/"
+            stats["regex_matched"] += 1
+        else:
+            work.at[i, "breakdown_category"] = "other"
+            work.at[i, "ai_confidence"] = 0.0
+            work.at[i, "ai_rationale"] = "no regex matched"
+            stats["other"] += 1
+
+        work.at[i, "failure_modes"] = infer_failure_mechanism(text)
+
+    return stats
+
+
+# =============================================================================
 # Main step4 processing (NO failure_mode column)
 # =============================================================================
 def step4_process(
@@ -479,103 +610,17 @@ def step4_process(
 
     mapping_out: Dict[str, Optional[str]] = {"functional_location": floc_col, "description": desc_col, "duration": used_col}
 
-    # Pass 1: AI on all rows
-    rows = [
-        {"id": int(i), "functional_location": str(work.at[i, "functional_location"]), "description": str(work.at[i, "description"])}
-        for i in work.index
-    ]
+    # Single LLM call: build a regex for each category from descriptions
+    all_descs = work["description"].tolist()
+    category_patterns = ai_build_category_regexes(
+        all_descs,
+        preferred or [],
+        machine_hint or "",
+        model=model,
+    )
 
-    stats = {"ai_fast": 0, "ai_refine": 0, "regex_fallback": 0}
-
-    fast_items: Dict[int, dict] = {}
-    for batch in _chunks(rows, 30):
-        items = _llm_classify_batch(
-            batch,
-            model=model,
-            machine_hint=machine_hint or "",
-            allowed_categories=preferred_categories or [],
-            temperature=0.0,
-            mode="fast",
-        )
-        for it in items:
-            rid = it.get("id")
-            if rid in work.index:
-                fast_items[int(rid)] = it
-    stats["ai_fast"] = len(fast_items)
-
-    low_conf_ids: List[int] = []
-    for i in work.index:
-        it = fast_items.get(int(i), {})
-        cat, mech, conf, rationale = _validate_item(it, allowed_set=allowed_set, description=str(work.at[i, "description"]))
-        work.at[i, "breakdown_category"] = cat
-        work.at[i, "failure_modes"] = mech
-        work.at[i, "ai_confidence"] = conf
-        work.at[i, "ai_rationale"] = rationale
-
-        if conf < ai_confidence_threshold or cat == "other":
-            low_conf_ids.append(int(i))
-
-    # Pass 2: refine low confidence only
-    if low_conf_ids:
-        refine_rows = [
-            {"id": int(i), "functional_location": str(work.at[i, "functional_location"]), "description": str(work.at[i, "description"])}
-            for i in low_conf_ids
-        ]
-        refine_items: Dict[int, dict] = {}
-        for batch in _chunks(refine_rows, 20):
-            items = _llm_classify_batch(
-                batch,
-                model=model,
-                machine_hint=machine_hint or "",
-                allowed_categories=preferred_categories or [],
-                temperature=0.0,
-                mode="refine",
-            )
-            for it in items:
-                rid = it.get("id")
-                if rid in work.index:
-                    refine_items[int(rid)] = it
-        stats["ai_refine"] = len(refine_items)
-
-        for i in low_conf_ids:
-            it = refine_items.get(int(i))
-            if not it:
-                continue
-            cat, mech, conf, rationale = _validate_item(it, allowed_set=allowed_set, description=str(work.at[i, "description"]))
-
-            cur_conf = float(work.at[i, "ai_confidence"] or 0.0)
-            cur_cat = str(work.at[i, "breakdown_category"] or "other")
-
-            if (conf > cur_conf) or (cur_cat == "other" and cat != "other"):
-                work.at[i, "breakdown_category"] = cat
-                work.at[i, "failure_modes"] = mech
-                work.at[i, "ai_confidence"] = conf
-                work.at[i, "ai_rationale"] = rationale
-
-    # Regex fallback only if still low confidence
-    for i in work.index:
-        conf = float(work.at[i, "ai_confidence"] or 0.0)
-        cat = str(work.at[i, "breakdown_category"] or "other")
-        if conf >= ai_confidence_threshold and cat != "other":
-            continue
-
-        rr = _deterministic_fallback(
-            description=str(work.at[i, "description"]),
-            machine_hint=machine_hint or "",
-            allowed_set=allowed_set,
-        )
-        if rr is None:
-            continue
-
-        if cat == "other" or rr.confidence > conf:
-            work.at[i, "breakdown_category"] = rr.category
-            if rr.mechanism_hint in MECHANISM_ENUM:
-                work.at[i, "failure_modes"] = rr.mechanism_hint
-            else:
-                work.at[i, "failure_modes"] = infer_failure_mechanism(str(work.at[i, "description"]))
-            work.at[i, "ai_confidence"] = max(conf, rr.confidence)
-            work.at[i, "ai_rationale"] = (str(work.at[i, "ai_rationale"]) + f" | {rr.rationale}").strip(" |")
-            stats["regex_fallback"] += 1
+    # Apply regexes deterministically to every row
+    stats = classify_by_regex(work, category_patterns, desc_col="description")
 
     # Final safety: mechanism enum always valid
     for i in work.index:

@@ -28,6 +28,7 @@ from db import (
     create_agent_run,
     finish_agent_run,
     insert_agent_output,
+    insert_agent_outputs_batch,
     list_artifacts,
     get_artifact,
     delete_artifact,
@@ -292,13 +293,23 @@ _INTENT_LABELS = {
 def _sanitize_for_json(obj: Any, depth: int = 0) -> Any:
     """Recursively convert a state dict to JSON-safe types."""
     if depth > 20:
-        return str(obj)
+        return "<truncated>"
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     if isinstance(obj, dict):
         return {str(k): _sanitize_for_json(v, depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize_for_json(v, depth + 1) for v in obj]
+    try:
+        import pandas as pd  # noqa: F811
+        if isinstance(obj, pd.DataFrame):
+            return f"<DataFrame {obj.shape[0]}x{obj.shape[1]}>"
+        if isinstance(obj, pd.Series):
+            return f"<Series len={len(obj)}>"
+        if isinstance(obj, pd.Timedelta):
+            return str(obj)
+    except ImportError:
+        pass
     try:
         import numpy as np
         if isinstance(obj, (np.integer,)):
@@ -311,13 +322,30 @@ def _sanitize_for_json(obj: Any, depth: int = 0) -> Any:
         pass
     if hasattr(obj, "isoformat"):
         return obj.isoformat()  # type: ignore[union-attr]
+    rep = repr(obj)
+    if len(rep) > 500:
+        return rep[:500] + "..."
     return str(obj)
+
+
+_WIZARD_STRIP_KEYS = frozenset({
+    "readiness_payload",
+    "categories_last_ai",
+})
 
 
 def _prepare_state_for_db(out: Dict[str, Any]) -> Dict[str, Any]:
     """Strip bulky runtime-only fields and sanitize for JSON storage."""
     skip_keys = {"artifact_context", "artifact_meta", "conversation_artifacts", "_conversation_id"}
     slim = {k: v for k, v in out.items() if k not in skip_keys}
+    wiz = slim.get("ram_wizard")
+    if isinstance(wiz, dict):
+        for k in _WIZARD_STRIP_KEYS:
+            if k in wiz:
+                wiz[k] = None
+    msgs = slim.get("messages")
+    if isinstance(msgs, list) and len(msgs) > 40:
+        slim["messages"] = msgs[-40:]
     return _sanitize_for_json(slim)
 
 
@@ -535,6 +563,7 @@ def _persist_generated_ram_artifacts(
             }
         )
 
+    batch_rows: List[Dict[str, Any]] = []
     for item in candidates:
         path_str = item.get("path")
         if not path_str:
@@ -545,17 +574,20 @@ def _persist_generated_ram_artifacts(
         if _artifact_exists(conversation_id, item["output_type"], str(path.resolve()), artifact_rows=artifact_rows):
             continue
 
-        insert_agent_output(
-            conversation_id=conversation_id,
-            run_id=run_id,
-            output_type=item["output_type"],
-            title=item.get("title"),
-            storage_provider="local",
-            storage_key=str(path.resolve()),
-            mime_type=item.get("mime_type"),
-            metadata={"generated_by": "ram_wizard"},
-        )
+        batch_rows.append({
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "output_type": item["output_type"],
+            "title": item.get("title"),
+            "storage_provider": "local",
+            "storage_key": str(path.resolve()),
+            "mime_type": item.get("mime_type"),
+            "metadata": {"generated_by": "ram_wizard"},
+        })
         created.append(item["output_type"])
+
+    if batch_rows:
+        insert_agent_outputs_batch(batch_rows)
 
     return created
 
@@ -869,6 +901,7 @@ def api_delete_artifact(artifact_id: str, request: Request, browser_id: Optional
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, request: Request):
     _require_auth(request)
+    _req_t0 = time.perf_counter()
 
     try:
         owner_key = _resolve_owner_key(req.browser_id)
@@ -943,16 +976,20 @@ def chat(req: ChatRequest, request: Request):
         )
 
         state["_conversation_id"] = conversation_id
+        _t_graph = time.perf_counter()
         out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})  # type: ignore[arg-type]
+        print(f"[perf] GRAPH.invoke: {time.perf_counter() - _t_graph:.1f}s", flush=True)
         SESSIONS[conversation_id] = out
-        SIM_PROGRESS.pop(conversation_id, None)
+        SIM_PROGRESS[conversation_id] = {"step": "done", "message": "Saving results...", "est_seconds": 15}
 
+        _t0 = time.perf_counter()
         created_output_types = _persist_generated_ram_artifacts(
             conversation_id=conversation_id,
             run_id=str(run["id"]),
             out=out,
             artifact_rows=artifact_rows,
         )
+        print(f"[perf] _persist_generated_ram_artifacts: {time.perf_counter() - _t0:.1f}s", flush=True)
         if created_output_types:
             artifact_rows = list_artifacts(conversation_id)
             out["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id, artifact_rows=artifact_rows)
@@ -993,13 +1030,18 @@ def chat(req: ChatRequest, request: Request):
         title = _build_conversation_title(out, conv, req.message)
 
         try:
+            _t0 = time.perf_counter()
             safe_state = _prepare_state_for_db(out)
+            _t1 = time.perf_counter()
+            print(f"[perf] _prepare_state_for_db: {_t1 - _t0:.1f}s | state keys: {list(safe_state.keys())} | "
+                  f"messages: {len(safe_state.get('messages', []))}", flush=True)
             update_conversation_after_turn(
                 conversation_id=conversation_id,
                 last_message_preview=assistant_text[:120],
                 last_state=safe_state,
                 title=title,
             )
+            print(f"[perf] update_conversation_after_turn: {time.perf_counter() - _t1:.1f}s", flush=True)
         except Exception:
             traceback.print_exc()
 
@@ -1014,6 +1056,9 @@ def chat(req: ChatRequest, request: Request):
             },
         )
 
+        SIM_PROGRESS.pop(conversation_id, None)
+
+        print(f"[perf] /api/chat total: {time.perf_counter() - _req_t0:.1f}s", flush=True)
         return ChatResponse(
             conversation_id=conversation_id,
             reply=assistant_text,

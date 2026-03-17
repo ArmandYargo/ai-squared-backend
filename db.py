@@ -284,6 +284,36 @@ def insert_agent_output(
         return row
 
 
+def insert_agent_outputs_batch(
+    rows: List[Dict[str, Any]],
+) -> int:
+    """Insert multiple agent_output rows in a single transaction (1 round-trip)."""
+    if not rows:
+        return 0
+    with get_conn() as conn, conn.cursor() as cur:
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO app.agent_outputs
+                    (conversation_id, run_id, output_type, title, storage_provider, storage_key, mime_type, metadata)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    r["conversation_id"],
+                    r.get("run_id"),
+                    r["output_type"],
+                    r.get("title"),
+                    r.get("storage_provider"),
+                    r.get("storage_key"),
+                    r.get("mime_type"),
+                    Jsonb(r.get("metadata") or {}),
+                ),
+            )
+        conn.commit()
+        return len(rows)
+
+
 def list_artifacts(conversation_id: str) -> List[Dict[str, Any]]:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(

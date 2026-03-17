@@ -809,15 +809,26 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             state,
             f"Selected file:\n{wiz['source_artifact_title'] or wiz['excel_path']}\n\nRunning data readiness check..."
         )
+        conv_id = state.get("_conversation_id") or ""
+        if _sim_progress_store is not None and conv_id:
+            _sim_progress_store[conv_id] = {
+                "step": "readiness",
+                "message": "Ingesting CMMS data and checking readiness...",
+                "est_seconds": 20,
+            }
         try:
             payload = check_ram_readiness(
                 excel_path=wiz.get("excel_path") or "",
                 machine=wiz.get("machine") or "",
             )
         except Exception as e:
+            if _sim_progress_store is not None and conv_id:
+                _sim_progress_store.pop(conv_id, None)
             _wizard_reply(state, f"Readiness check failed: {type(e).__name__}: {e}\n\n{_artifact_prompt_hint(state)}")
             wiz["step"] = "file"
             return state
+        if _sim_progress_store is not None and conv_id:
+            _sim_progress_store.pop(conv_id, None)
 
         wiz["readiness_payload"] = payload
         readiness_ok = (payload.get("readiness") or {}).get("ok_to_simulate", False)
@@ -1082,7 +1093,11 @@ def node_ram_wizard(state: AgentState) -> AgentState:
 
         conv_id = state.get("_conversation_id") or ""
         if _sim_progress_store is not None and conv_id:
-            _sim_progress_store[conv_id] = {"step": "classification", "message": "Classifying work-order data..."}
+            _sim_progress_store[conv_id] = {
+                "step": "classification",
+                "message": "Classifying work-order data and building input sheet...",
+                "est_seconds": 45,
+            }
         try:
             result = run_ram_pipeline_compat(
                 input_xlsx_path=wiz.get("excel_path"),
@@ -1333,9 +1348,14 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             sims = int(wiz.get("simulations") or 2)
 
             conv_id = state.get("_conversation_id") or ""
+            est_sim_seconds = sims * 12
             print(f"[SIM] conv_id for progress tracking: '{conv_id}' | store={_sim_progress_store is not None}", flush=True)
             if _sim_progress_store is not None and conv_id:
-                _sim_progress_store[conv_id] = {"step": "simulation", "message": "Starting simulation..."}
+                _sim_progress_store[conv_id] = {
+                    "step": "simulation",
+                    "message": "Starting simulation...",
+                    "est_seconds": est_sim_seconds,
+                }
             def _progress_cb(info: dict) -> None:
                 if _sim_progress_store is not None and conv_id:
                     info["step"] = "simulation"

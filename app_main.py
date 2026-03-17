@@ -78,6 +78,7 @@ class ChatResponse(BaseModel):
     reply: str
     speaker: str = "ASSISTANT"
     raw_state: Optional[Dict[str, Any]] = None
+    wizard_ui: Optional[Dict[str, Any]] = None
 
 
 class LoginRequest(BaseModel):
@@ -865,6 +866,7 @@ def chat(req: ChatRequest, request: Request):
             reply=assistant_text,
             speaker=assistant_speaker,
             raw_state=None,
+            wizard_ui=assistant_msg.get("wizard_ui"),
         )
 
     except HTTPException as e:
@@ -944,6 +946,24 @@ async def upload_file(
             title=(conv.get("title") if conv and conv.get("title") else file.filename),
         )
 
+        # Auto-advance wizard if it's waiting on the "file" step
+        auto_reply = None
+        state = SESSIONS.get(conversation_id)
+        wiz = (state or {}).get("ram_wizard") or {}
+        if state and wiz.get("active") and wiz.get("step") == "file":
+            state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
+            state["messages"] = state.get("messages", []) + [
+                {"role": "user", "content": "proceed"}
+            ]
+            out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})  # type: ignore[arg-type]
+            SESSIONS[conversation_id] = out
+
+            msgs = out.get("messages") or []
+            for m in reversed(msgs):
+                if m.get("role") == "assistant":
+                    auto_reply = m.get("content", "")
+                    break
+
         return {
             "ok": True,
             "conversation_id": conversation_id,
@@ -953,6 +973,7 @@ async def upload_file(
             "server_path": str(out_path.resolve()),
             "mime_type": file.content_type,
             "metadata": artifact.get("metadata") or {},
+            "auto_reply": auto_reply,
         }
     except HTTPException:
         raise

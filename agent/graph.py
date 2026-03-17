@@ -465,8 +465,11 @@ def node_qa(state: AgentState) -> AgentState:
 # -------------------------
 # RAM Wizard + Simulation
 # -------------------------
-def _wizard_reply(state: AgentState, text: str) -> None:
-    state.setdefault("messages", []).append({"role": "assistant", "content": text, "speaker": "WIZARD"})
+def _wizard_reply(state: AgentState, text: str, wizard_ui: Optional[Dict[str, Any]] = None) -> None:
+    msg: Dict[str, Any] = {"role": "assistant", "content": text, "speaker": "WIZARD"}
+    if wizard_ui:
+        msg["wizard_ui"] = wizard_ui
+    state.setdefault("messages", []).append(msg)
 
 
 def _parse_date_yyyy_mm_dd(s: str):
@@ -791,7 +794,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             state,
             "Coarse component categories:\n"
             f"{_format_numbered_categories(wiz['categories'])}\n\n"
-            "Press ENTER to accept these categories.\n"
+            "Type 'accept' to confirm these categories.\n"
             "Or type an edit instruction (e.g., 'remove idler', 'add gearbox', 'rename idler to idler_set').\n"
             "Tip: type 'reset' to re-generate from AI."
         )
@@ -809,11 +812,20 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             f"Categories accepted.\n\n"
             f"Component maintenance practices (default: {default_name}):\n"
             f"{_format_component_practices(cats, practices)}\n\n"
-            "Happy with these maintenance practices? (y/n)"
+            "Happy with these maintenance practices? (y/n)",
+            wizard_ui={
+                "type": "maintenance_table",
+                "categories": cats,
+                "practices": practices,
+                "legend": {str(k): v for k, v in _PRACTICE_CODE_TO_NAME.items()},
+            },
         )
 
+    _ACCEPT_KEYWORDS = {"", "accept", "ok", "okay", "proceed", "continue", "done",
+                        "y", "yes", "confirm", "looks good", "lgtm"}
+
     if wiz["step"] == "categories_edit":
-        if user_text == "":
+        if user_lower in _ACCEPT_KEYWORDS:
             _go_to_maintenance_review()
             return state
 
@@ -826,10 +838,11 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 state,
                 "Categories reset from AI:\n"
                 f"{_format_numbered_categories(wiz['categories'])}\n\n"
-                "Press ENTER to accept, or type another edit."
+                "Type 'accept' to confirm, or type an edit instruction."
             )
             return state
 
+        old_cats = list(wiz.get("categories") or [])
         model = os.environ.get("RAM_CAT_MODEL", "gpt-5.2")
         try:
             wiz["categories"] = ai_apply_edit_to_components(
@@ -843,7 +856,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             state,
             "Updated categories:\n"
             f"{_format_numbered_categories(wiz['categories'])}\n\n"
-            "Continue with these categories? (Y/N)"
+            "Happy with these? Type 'accept' to confirm, or type another edit."
         )
         wiz["step"] = "categories_confirm_or_edit"
         return state
@@ -851,7 +864,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     if wiz["step"] == "categories_confirm_or_edit":
         t = user_lower
 
-        if t in {"y", "yes"}:
+        if t in _ACCEPT_KEYWORDS:
             _go_to_maintenance_review()
             return state
 
@@ -859,7 +872,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             wiz["step"] = "categories_edit"
             _wizard_reply(
                 state,
-                "Okay — enter another edit, or press ENTER to accept:\n"
+                "Okay — type an edit instruction, or 'accept' to confirm:\n"
                 f"{_format_numbered_categories(wiz['categories'])}"
             )
             return state
@@ -873,7 +886,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 state,
                 "Categories reset from AI:\n"
                 f"{_format_numbered_categories(wiz['categories'])}\n\n"
-                "Continue with these categories? (Y/N)"
+                "Happy with these? Type 'accept' to confirm, or type another edit."
             )
             return state
 
@@ -890,7 +903,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             state,
             "Updated categories:\n"
             f"{_format_numbered_categories(wiz['categories'])}\n\n"
-            "Continue with these categories? (Y/N)"
+            "Happy with these? Type 'accept' to confirm, or type another edit."
         )
         return state
 
@@ -903,13 +916,21 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         if t in {"n", "no"}:
             wiz["step"] = "maintenance_edit"
             cats = wiz.get("categories") or []
+            practices = wiz.get("component_practices") or {}
             _wizard_reply(
                 state,
                 "Edit maintenance practices:\n"
                 "Type 'all: [practice]' to change all components, or\n"
-                "list specific changes like '1: Preventative, 3: Condition based'\n\n"
-                "Practices: Reactive, Corrective, Preventative, Condition based\n\n"
-                f"{_format_component_practices(cats, wiz.get('component_practices') or {})}"
+                "list specific changes like '1:0, 3:2'\n\n"
+                "0 = Reactive, 1 = Corrective, 2 = Preventative, 3 = Condition based\n\n"
+                f"{_format_component_practices(cats, practices)}",
+                wizard_ui={
+                    "type": "maintenance_table",
+                    "categories": cats,
+                    "practices": practices,
+                    "legend": {str(k): v for k, v in _PRACTICE_CODE_TO_NAME.items()},
+                    "editable": True,
+                },
             )
             return state
         _wizard_reply(state, "Please type 'y' (accept) or 'n' (edit practices).")
@@ -920,30 +941,33 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         practices = dict(wiz.get("component_practices") or {})
         raw = user_text_stripped
 
-        # Parse "all: Practice"
+        # Parse "all: Practice" or "all: 2"
         if raw.lower().startswith("all:"):
-            pname = raw[4:].strip().lower()
-            code = _PRACTICE_NAME_TO_CODE.get(pname)
+            val = raw[4:].strip().lower()
+            if val.isdigit() and int(val) in _PRACTICE_CODE_TO_NAME:
+                code = int(val)
+            else:
+                code = _PRACTICE_NAME_TO_CODE.get(val)
             if code is None:
                 _wizard_reply(
                     state,
                     f"Unknown practice '{raw[4:].strip()}'. "
-                    "Use: Reactive, Corrective, Preventative, or Condition based."
+                    "Use: 0 (Reactive), 1 (Corrective), 2 (Preventative), 3 (Condition based)."
                 )
                 return state
             for c in cats:
                 practices[c] = code
         else:
-            # Parse "1: Preventative, 3: Condition based"
+            # Parse "1:0, 3:2" or "1: Preventative, 3: Condition based"
             parts = [p.strip() for p in raw.split(",") if p.strip()]
             errors = []
             for part in parts:
                 if ":" not in part:
-                    errors.append(f"'{part}' -- expected format 'number: practice'")
+                    errors.append(f"'{part}' -- expected format 'number:practice'")
                     continue
-                num_str, pname = part.split(":", 1)
+                num_str, pval = part.split(":", 1)
                 num_str = num_str.strip()
-                pname = pname.strip().lower()
+                pval = pval.strip().lower()
                 if not num_str.isdigit():
                     errors.append(f"'{num_str}' is not a valid component number")
                     continue
@@ -951,9 +975,12 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 if idx < 0 or idx >= len(cats):
                     errors.append(f"Component {num_str} is out of range (1-{len(cats)})")
                     continue
-                code = _PRACTICE_NAME_TO_CODE.get(pname)
+                if pval.isdigit() and int(pval) in _PRACTICE_CODE_TO_NAME:
+                    code = int(pval)
+                else:
+                    code = _PRACTICE_NAME_TO_CODE.get(pval)
                 if code is None:
-                    errors.append(f"Unknown practice '{pname}'. Use: Reactive, Corrective, Preventative, Condition based")
+                    errors.append(f"Unknown practice '{pval}'. Use: 0-3 or name (Reactive, Corrective, Preventative, Condition based)")
                     continue
                 practices[cats[idx]] = code
             if errors:
@@ -966,7 +993,13 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             state,
             "Updated maintenance practices:\n"
             f"{_format_component_practices(cats, practices)}\n\n"
-            "Happy with these maintenance practices? (y/n)"
+            "Happy with these maintenance practices? (y/n)",
+            wizard_ui={
+                "type": "maintenance_table",
+                "categories": cats,
+                "practices": practices,
+                "legend": {str(k): v for k, v in _PRACTICE_CODE_TO_NAME.items()},
+            },
         )
         return state
 

@@ -245,6 +245,12 @@ def _looks_like_ram_start(text: str) -> bool:
         "start simulation",
         "simulate ram",
         "run simulation",
+        "start over",
+        "start again",
+        "restart",
+        "begin again",
+        "from the beginning",
+        "from scratch",
     ]
     return any(p in t for p in phrases)
 
@@ -717,6 +723,23 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     user_text = (_msgs[-1].get("content", "") if _msgs else "")
     user_text_stripped = user_text.strip()
     user_lower = user_text_stripped.lower()
+
+    _START_OVER_PHRASES = (
+        "start over", "start again", "restart", "begin again",
+        "redo", "from the beginning", "from scratch",
+    )
+    if any(p in user_lower for p in _START_OVER_PHRASES):
+        state["ram_wizard"] = {"active": True, "step": "machine"}
+        latest = _latest_excel_artifact(state)
+        extra = f"\nI can already see an uploaded workbook: {latest.get('title')}" if latest else ""
+        _wizard_reply(
+            state,
+            "Starting over.\n\n"
+            "RAM Input Sheet Wizard restarted.\n"
+            "What machine are we working on?"
+            f"{extra}"
+        )
+        return state
 
     if "?" in user_text_stripped and _looks_like_question(user_text_stripped):
         print(f"[wizard] Question detected during step '{wiz.get('step')}': {user_text_stripped[:80]}", flush=True)

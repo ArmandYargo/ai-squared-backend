@@ -580,7 +580,10 @@ def _pick_excel_file_dialog() -> Optional[str]:
 
 
 def _format_readiness_summary(readiness_payload: Dict[str, Any]) -> str:
+    total_rows = readiness_payload.get("total_rows")
+    machine_rows = readiness_payload.get("machine_rows")
     subset_rows = readiness_payload.get("subset_rows", 0)
+    date_meta = readiness_payload.get("date_meta") or {}
     readiness = readiness_payload.get("readiness") or {}
     ok = readiness.get("ok_to_simulate", None)
     metrics = readiness.get("metrics") or {}
@@ -589,7 +592,16 @@ def _format_readiness_summary(readiness_payload: Dict[str, Any]) -> str:
     message = readiness.get("message", "")
 
     lines: List[str] = []
-    lines.append(f"- Rows matched for machine: {subset_rows}")
+    if total_rows is not None:
+        lines.append(f"- Total rows in file: {total_rows}")
+    if machine_rows is not None:
+        lines.append(f"- Rows matched for machine: {machine_rows}")
+    if not date_meta.get("skipped"):
+        start = date_meta.get("start_date", "?")[:10]
+        end = date_meta.get("end_date", "?")[:10]
+        lines.append(f"- Rows after date filter ({start} to {end}): {subset_rows}")
+    elif machine_rows is None:
+        lines.append(f"- Rows matched for machine: {subset_rows}")
     lines.append(f"- OK to simulate: {'Yes' if ok else 'No'}")
 
     if metrics:
@@ -875,6 +887,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             payload = check_ram_readiness(
                 excel_path=wiz.get("excel_path") or "",
                 machine=wiz.get("machine") or "",
+                date_range_text=wiz.get("date_range_text"),
             )
         except Exception as e:
             if _sim_progress_store is not None and conv_id:

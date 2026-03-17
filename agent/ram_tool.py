@@ -15,7 +15,7 @@ RAM_MODULE_DIR = Path(__file__).resolve().parents[1] / "ram_module"
 if str(RAM_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(RAM_MODULE_DIR))
 
-from func_ingest_data import ingest_cmms_workbook, assess_ram_readiness_for_machine
+from func_ingest_data import ingest_cmms_workbook, assess_ram_readiness_for_machine, assess_ram_readiness
 from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
 from func_classify_data import step4_with_query, step4_process
 from func_analyse_data import analyse_and_append_to_excel  # IMPORTANT: signature is (classified_df, excel_path, ...)
@@ -44,27 +44,53 @@ def check_ram_readiness(
     model: str = "gpt-5.2",
     min_coverage: float = 0.80,
     match_scope: str = "both",
+    date_range_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run only the early pipeline steps needed to decide whether the selected file
     is "ready" for building a RAM input sheet.
+
+    Applies two filters before computing readiness:
+      1. Machine filter (AI regex on FLOC/description)
+      2. Date filter (user-supplied date range)
     """
     df_master, report = ingest_cmms_workbook(excel_path, model=model, min_coverage=min_coverage)
+    mapping = report["mapping"]
 
     subset, readiness, filt_meta = assess_ram_readiness_for_machine(
         df_master,
-        report["mapping"],
+        mapping,
         machine,
         model=model,
         min_coverage=min_coverage,
         match_scope=match_scope,
     )
 
+    machine_rows = int(len(subset))
+
+    date_filtered, date_meta = _apply_date_filter(subset, mapping, date_range_text)
+    date_rows = int(len(date_filtered))
+
+    if date_meta.get("skipped"):
+        final_subset = subset
+    else:
+        final_subset = date_filtered
+        readiness = assess_ram_readiness(
+            final_subset,
+            floc_col=mapping.get("functional_location"),
+            desc_col=mapping.get("description"),
+            duration_col="breakdown_duration_hours",
+            min_coverage=min_coverage,
+        )
+
     return {
         "excel_path": excel_path,
         "machine": machine,
-        "subset_rows": int(len(subset)),
-        "mapping": report.get("mapping", {}),
+        "total_rows": int(len(df_master)),
+        "machine_rows": machine_rows,
+        "subset_rows": int(len(final_subset)),
+        "date_meta": date_meta,
+        "mapping": mapping,
         "readiness": readiness,
         "filt_meta": filt_meta,
     }

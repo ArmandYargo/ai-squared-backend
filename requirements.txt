@@ -17,7 +17,6 @@ matplotlib
 xarray
 python-dateutil
 
-chromadb
 sentence-transformers
 pypdf
 python-docx

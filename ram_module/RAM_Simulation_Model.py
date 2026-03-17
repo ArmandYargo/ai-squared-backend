@@ -32,6 +32,7 @@ Change Controls:
 import warnings
 warnings.filterwarnings('ignore')
 
+import os
 import simpy
 import pandas as pd
 import numpy as np
@@ -39,6 +40,9 @@ from scipy.stats import norm
 import datetime
 from datetime import date, timedelta, datetime
 import random
+import matplotlib
+if os.environ.get("RENDER"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from dateutil.relativedelta import relativedelta
 import math

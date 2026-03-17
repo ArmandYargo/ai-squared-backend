@@ -22,3 +22,6 @@ class AgentState(TypedDict, total=False):
     ram_wizard: Dict[str, Any]
     ram_command: str
     route_meta: Dict[str, Any]
+
+    # Runtime: conversation ID for progress tracking (set by app_main before invoke)
+    _conversation_id: str

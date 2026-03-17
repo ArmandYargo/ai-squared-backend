@@ -1080,6 +1080,9 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Please type 'yes' to proceed or 'no' to cancel.")
             return state
 
+        conv_id = state.get("_conversation_id") or ""
+        if _sim_progress_store is not None and conv_id:
+            _sim_progress_store[conv_id] = {"step": "classification", "message": "Classifying work-order data..."}
         try:
             result = run_ram_pipeline_compat(
                 input_xlsx_path=wiz.get("excel_path"),
@@ -1090,8 +1093,12 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 component_practices=wiz.get("component_practices"),
             )
         except Exception as e:
+            if _sim_progress_store is not None and conv_id:
+                _sim_progress_store.pop(conv_id, None)
             _wizard_reply(state, f"Input-sheet pipeline failed: {type(e).__name__}: {e}")
             return state
+        if _sim_progress_store is not None and conv_id:
+            _sim_progress_store.pop(conv_id, None)
 
         outputs = result.get("outputs") or {}
         ram_input_path = (
@@ -1326,9 +1333,14 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             sims = int(wiz.get("simulations") or 2)
 
             conv_id = state.get("_conversation_id") or ""
+            print(f"[SIM] conv_id for progress tracking: '{conv_id}' | store={_sim_progress_store is not None}", flush=True)
+            if _sim_progress_store is not None and conv_id:
+                _sim_progress_store[conv_id] = {"step": "simulation", "message": "Starting simulation..."}
             def _progress_cb(info: dict) -> None:
                 if _sim_progress_store is not None and conv_id:
+                    info["step"] = "simulation"
                     _sim_progress_store[conv_id] = info
+                    print(f"[SIM] progress: {info}", flush=True)
 
             archive = run_ram_simulation_archived(
                 input_xlsx=wiz.get("ram_input_path") or "",

@@ -704,7 +704,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(
             state,
             "RAM Input Sheet Wizard started.\n"
-            "What machine are we working on? (e.g., 'Conveyor CV-101')"
+            "What machine are we working on?"
             f"{extra}"
         )
         return state
@@ -883,8 +883,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         default_name = _PRACTICE_CODE_TO_NAME.get(default_code, "Reactive")
         _wizard_reply(
             state,
-            f"Categories accepted. Default maintenance practice: {default_name}\n\n"
-            "Happy with these maintenance practices? (y/n)",
+            f"Categories accepted. Default maintenance practice: {default_name}",
             wizard_ui={
                 "type": "maintenance_table",
                 "categories": cats,
@@ -892,6 +891,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 "legend": {str(k): v for k, v in _PRACTICE_CODE_TO_NAME.items()},
             },
         )
+        _wizard_reply(state, "Happy with these maintenance practices? (y/n)")
 
     _ACCEPT_KEYWORDS = {"", "accept", "ok", "okay", "proceed", "continue", "done",
                         "y", "yes", "confirm", "looks good", "lgtm"}
@@ -1059,7 +1059,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "maintenance_review"
         _wizard_reply(
             state,
-            "Updated maintenance practices.\n\nHappy with these? (y/n)",
+            "Updated maintenance practices.",
             wizard_ui={
                 "type": "maintenance_table",
                 "categories": cats,
@@ -1067,6 +1067,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 "legend": {str(k): v for k, v in _PRACTICE_CODE_TO_NAME.items()},
             },
         )
+        _wizard_reply(state, "Happy with these? (y/n)")
         return state
 
     if wiz["step"] == "confirm_create":
@@ -1290,28 +1291,30 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
         wiz["sim_end"] = t
 
-        _wizard_reply(state, "How many Monte Carlo simulations? Default: 200 (type a number)")
+        _wizard_reply(state, "How many Monte Carlo simulations? Default: 2 (type a number)")
         wiz["step"] = "sim_sims"
         return state
 
     if wiz["step"] == "sim_sims":
-        t = user_text_stripped or "200"
+        t = user_text_stripped or "2"
         try:
             sims = int(t)
             if sims <= 0:
                 raise ValueError
         except Exception:
-            _wizard_reply(state, "Please enter a positive integer (e.g., 200).")
+            _wizard_reply(state, "Please enter a positive integer (e.g., 2).")
             return state
         wiz["simulations"] = sims
         wiz["step"] = "sim_run"
         _wizard_reply(state, "Running simulation + archiving results...")
 
     if wiz["step"] == "sim_run":
+        import time as _sim_time
+        _sim_wall_start = _sim_time.perf_counter()
         try:
             start = _parse_date_yyyy_mm_dd(wiz.get("sim_start") or "")
             end = _parse_date_yyyy_mm_dd(wiz.get("sim_end") or "")
-            sims = int(wiz.get("simulations") or 200)
+            sims = int(wiz.get("simulations") or 2)
 
             conv_id = state.get("_conversation_id") or ""
             def _progress_cb(info: dict) -> None:
@@ -1338,15 +1341,23 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             )
             return state
 
+        _sim_wall_elapsed = _sim_time.perf_counter() - _sim_wall_start
+
         wiz["sim_archive_dir"] = archive.run_dir
         wiz["sim_metadata_path"] = archive.metadata_path
         wiz["sim_outputs"] = archive.outputs
         wiz["sim_conditions"] = archive.conditions
         wiz["active"] = False
         wiz["step"] = "done"
+
+        period_days = (end - start).days
+        period_str = f"{period_days} days (~{period_days // 365} years)"
         _wizard_reply(
             state,
-            "Simulation complete ✅\n"
+            "Simulation complete.\n"
+            f"- simulations: {sims}\n"
+            f"- period: {start} to {end} ({period_str})\n"
+            f"- total time: {_sim_wall_elapsed:.1f}s\n"
             f"- archived run dir: {archive.run_dir}\n"
             f"- metadata: {archive.metadata_path}\n"
             f"- saved outputs: {archive.summary.get('saved_outputs_count')}\n"

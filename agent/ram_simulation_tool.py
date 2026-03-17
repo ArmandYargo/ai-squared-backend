@@ -229,7 +229,7 @@ def run_ram_simulation_archived(
     input_xlsx: str,
     start_date: date,
     end_date: date,
-    simulations: int = 200,
+    simulations: int = 2,
     agg: str = "50th_perc",
     opp_dt_ind: int = 0,
     spare_ind: int = 0,

@@ -402,7 +402,7 @@ def build_comp_att_from_summary(
 
 def build_timelines(start_date: date) -> Dict[str, pd.DataFrame]:
     ts = pd.to_datetime(start_date)
-    to = ts + pd.DateOffset(years=60)  # timeline horizon (buffer to avoid edge overshoots)
+    to = ts + pd.DateOffset(years=10)
 
     def _row(mp: str, rating: float, serv: int, pro: int, active: int):
         return pd.DataFrame([{

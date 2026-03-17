@@ -289,6 +289,38 @@ _INTENT_LABELS = {
 }
 
 
+def _sanitize_for_json(obj: Any, depth: int = 0) -> Any:
+    """Recursively convert a state dict to JSON-safe types."""
+    if depth > 20:
+        return str(obj)
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v, depth + 1) for v in obj]
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    except ImportError:
+        pass
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()  # type: ignore[union-attr]
+    return str(obj)
+
+
+def _prepare_state_for_db(out: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip bulky runtime-only fields and sanitize for JSON storage."""
+    skip_keys = {"artifact_context", "artifact_meta", "conversation_artifacts", "_conversation_id"}
+    slim = {k: v for k, v in out.items() if k not in skip_keys}
+    return _sanitize_for_json(slim)
+
+
 def _build_conversation_title(
     out: Dict[str, Any],
     conv: Optional[Dict[str, Any]],
@@ -801,8 +833,11 @@ def chat(req: ChatRequest, request: Request):
 
         state = SESSIONS.get(conversation_id)
         if state is None:
-            saved_state = conv.get("last_state") if conv else {}
-            state = saved_state or {
+            saved_state = (conv.get("last_state") if conv else None) or {}
+            if saved_state and saved_state.get("ram_wizard", {}).get("active"):
+                print(f"[state-restore] Restoring wizard state from DB for {conversation_id}: "
+                      f"step={saved_state['ram_wizard'].get('step')}", flush=True)
+            state = saved_state if saved_state else {
                 "messages": [],
                 "ram_wizard": {"active": False, "step": "machine"},
                 "intent": "qa",
@@ -903,12 +938,16 @@ def chat(req: ChatRequest, request: Request):
 
         title = _build_conversation_title(out, conv, req.message)
 
-        update_conversation_after_turn(
-            conversation_id=conversation_id,
-            last_message_preview=assistant_text[:120],
-            last_state=out,
-            title=title,
-        )
+        try:
+            safe_state = _prepare_state_for_db(out)
+            update_conversation_after_turn(
+                conversation_id=conversation_id,
+                last_message_preview=assistant_text[:120],
+                last_state=safe_state,
+                title=title,
+            )
+        except Exception:
+            traceback.print_exc()
 
         finish_agent_run(
             run_id=str(run["id"]),
@@ -1042,7 +1081,7 @@ async def upload_file(
 
 
 @app.get("/api/progress/{conversation_id}")
-def get_progress(conversation_id: str, request: Request):
+async def get_progress(conversation_id: str, request: Request):
     _require_auth(request)
     return SIM_PROGRESS.get(conversation_id, {})
 

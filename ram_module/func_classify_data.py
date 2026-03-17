@@ -406,8 +406,101 @@ def _validate_item(
 
 
 # =============================================================================
-# Regex-based classification (single LLM call + deterministic apply)
+# Two-signal classification: FLOC code (primary) + description regex (secondary)
 # =============================================================================
+
+def _build_floc_code_map(
+    floc_series: pd.Series,
+    categories: List[str],
+    machine_hint: str,
+    *,
+    model: str = "gpt-5.2",
+) -> Dict[str, str]:
+    """
+    Extract unique FLOC type-codes and ask the LLM to map each code to a
+    category.  FLOC codes like 'BET-001', 'ELE-PNL-001', 'CHU-001' are the
+    primary signal for classification.
+    Returns {code_prefix: category}, e.g. {'BET': 'belt', 'ELE': 'electrical'}.
+    """
+    raw_flocs = floc_series.dropna().astype(str).unique().tolist()
+
+    codes: List[str] = []
+    for f in raw_flocs:
+        parts = f.split("-")
+        for i in range(len(parts) - 1, 0, -1):
+            candidate = "-".join(parts[i:])
+            if any(c.isalpha() for c in candidate):
+                codes.append(candidate)
+                break
+
+    unique_codes = sorted(set(codes))[:80]
+    if not unique_codes:
+        return {}
+
+    cats_norm = [_normalize_cat(c) for c in categories if _normalize_cat(c)]
+
+    schema = {
+        "name": "floc_code_mapping",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "mappings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string"},
+                            "category": {"type": "string"},
+                        },
+                        "required": ["code", "category"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["mappings"],
+            "additionalProperties": False,
+        },
+    }
+
+    prompt = {
+        "role": "user",
+        "content": (
+            f"{_DOMAIN_LINE}\n"
+            "I have equipment FLOC (Functional Location) type-codes from SAP and a set of "
+            "coarse breakdown categories.  Map each code to the BEST matching category.\n\n"
+            "Common SAP FLOC naming conventions:\n"
+            "- BET = belt, PUL = pulley, IDL = idler, DRV/DRI = drive\n"
+            "- ELE/ELC = electrical, PNL = panel, SWH = switch, MOT = motor\n"
+            "- CHU = chute, SCA = scraper, STR/STL = structure\n"
+            "- INE/INS = instrumentation, TSM = transmitter, DTE = detector, MET = meter\n"
+            "- HYD = hydraulic, VLV = valve, GBX = gearbox\n"
+            "- PWR/POW = power_supply\n\n"
+            "If a code does not fit any category, map it to 'other'.\n\n"
+            f"Machine: {machine_hint}\n"
+            f"Categories: {cats_norm}\n"
+            f"FLOC type-codes: {unique_codes}\n\n"
+            "Return ONLY JSON."
+        ),
+    }
+
+    obj = _llm_json(
+        model=model,
+        messages=[{"role": "system", "content": "Return only JSON."}, prompt],
+        json_schema=schema,
+        temperature=0.0,
+        max_tokens=1500,
+    )
+
+    code_map: Dict[str, str] = {}
+    allowed = set(cats_norm) | {"other"}
+    for item in obj.get("mappings", []):
+        code = (item.get("code") or "").strip()
+        cat = _normalize_cat(item.get("category", ""))
+        if code and cat and cat in allowed:
+            code_map[code.upper()] = cat
+    return code_map
+
 
 def ai_build_category_regexes(
     descriptions: List[str],
@@ -418,7 +511,8 @@ def ai_build_category_regexes(
 ) -> Dict[str, "re.Pattern[str]"]:
     """
     Ask the LLM once to produce a regex for each category based on sample
-    descriptions.  Returns {category: compiled_regex}.
+    descriptions.  Returns {category: compiled_regex}.  Used as a secondary
+    classifier when the FLOC code doesn't resolve a category.
     """
     unique_descs = list(dict.fromkeys(d.strip() for d in descriptions if d.strip()))
     sample = unique_descs[:150]
@@ -456,18 +550,20 @@ def ai_build_category_regexes(
         "role": "user",
         "content": (
             f"{_DOMAIN_LINE}\n"
-            "I have a list of maintenance work-order descriptions for a machine and a set of "
-            "coarse breakdown CATEGORIES.  For EACH category, write a single Python-compatible "
-            "case-insensitive regex that matches descriptions belonging to that category.\n\n"
+            "I have maintenance work-order DESCRIPTION text (free-text, often written by "
+            "semi-literate operators — expect abbreviations, misspellings, and shorthand).  "
+            "For EACH breakdown category, write a Python case-insensitive regex that matches "
+            "descriptions belonging to that category.\n\n"
             "Rules:\n"
-            "- Study the sample descriptions carefully — look for keywords, part names, "
-            "abbreviations, and patterns that distinguish each category.\n"
-            "- Each regex should be broad enough to capture variations (plurals, abbreviations, "
-            "misspellings) but specific enough to avoid false positives.\n"
-            "- Use alternation (|) generously.  Do NOT use look-aheads/look-behinds.\n"
-            "- A description may match multiple categories; the first match wins, so order "
-            "the most specific categories first.\n"
-            "- Do NOT include an 'other' category — unmatched rows are automatically 'other'.\n\n"
+            "- Study the sample descriptions carefully.\n"
+            "- Be BROAD: use alternation (|) generously for synonyms, abbreviations, "
+            "common misspellings, partial words.\n"
+            "- Keywords to look for: part names (belt, roller, idler, pulley, chute, motor, "
+            "scraper, gearbox), actions (tear, broken, worn, skew, alignment, sparks, noise), "
+            "sensor/electrical terms (underspeed, blockchute, alarm, fault, trip, interlock, "
+            "sima code, pullwire, retain).\n"
+            "- Do NOT use look-aheads/look-behinds. Use \\b for word boundaries where helpful.\n"
+            "- Do NOT include an 'other' category.\n\n"
             f"Machine scope: {machine_hint}\n"
             f"Categories (snake_case): {cats_norm}\n\n"
             f"Sample descriptions ({len(sample)} of {len(unique_descs)} unique):\n"
@@ -481,7 +577,7 @@ def ai_build_category_regexes(
         messages=[{"role": "system", "content": "Return only JSON."}, prompt],
         json_schema=schema,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=3500,
     )
 
     patterns: Dict[str, "re.Pattern[str]"] = {}
@@ -497,41 +593,57 @@ def ai_build_category_regexes(
     return patterns
 
 
-def classify_by_regex(
+def classify_two_signal(
     work: pd.DataFrame,
-    category_patterns: Dict[str, "re.Pattern[str]"],
+    floc_code_map: Dict[str, str],
+    desc_patterns: Dict[str, "re.Pattern[str]"],
+    floc_col: str = "functional_location",
     desc_col: str = "description",
 ) -> Dict[str, int]:
     """
-    Apply pre-built category regexes to every row in *work*.
-    Mutates work in-place (breakdown_category, failure_modes, ai_confidence,
-    ai_rationale).  Returns stats dict.
+    Classify every row using two signals:
+      1. FLOC type-code (primary, high confidence)
+      2. Description regex (secondary, lower confidence)
+    Mutates work in-place.  Returns stats dict.
     """
-    stats = {"regex_matched": 0, "other": 0}
-    ordered = list(category_patterns.items())
+    stats = {"floc_matched": 0, "desc_matched": 0, "other": 0}
+    desc_ordered = list(desc_patterns.items())
 
     for i in work.index:
-        text = str(work.at[i, desc_col])
+        floc_val = str(work.at[i, floc_col]).upper()
+        desc_val = str(work.at[i, desc_col])
+
         matched_cat = None
-        matched_pat = ""
-        for cat, pat in ordered:
-            if pat.search(text):
+        source = ""
+
+        for code, cat in floc_code_map.items():
+            if cat == "other":
+                continue
+            if code.upper() in floc_val:
                 matched_cat = cat
-                matched_pat = pat.pattern
+                source = f"FLOC code contains '{code}'"
+                stats["floc_matched"] += 1
                 break
+
+        if not matched_cat:
+            for cat, pat in desc_ordered:
+                if pat.search(desc_val):
+                    matched_cat = cat
+                    source = f"description regex: /{pat.pattern}/"
+                    stats["desc_matched"] += 1
+                    break
 
         if matched_cat:
             work.at[i, "breakdown_category"] = matched_cat
-            work.at[i, "ai_confidence"] = 0.90
-            work.at[i, "ai_rationale"] = f"regex match: /{matched_pat}/"
-            stats["regex_matched"] += 1
+            work.at[i, "ai_confidence"] = 0.95 if "FLOC" in source else 0.80
+            work.at[i, "ai_rationale"] = source
         else:
             work.at[i, "breakdown_category"] = "other"
             work.at[i, "ai_confidence"] = 0.0
-            work.at[i, "ai_rationale"] = "no regex matched"
+            work.at[i, "ai_rationale"] = "no FLOC code or description match"
             stats["other"] += 1
 
-        work.at[i, "failure_modes"] = infer_failure_mechanism(text)
+        work.at[i, "failure_modes"] = infer_failure_mechanism(desc_val)
 
     return stats
 
@@ -610,17 +722,28 @@ def step4_process(
 
     mapping_out: Dict[str, Optional[str]] = {"functional_location": floc_col, "description": desc_col, "duration": used_col}
 
-    # Single LLM call: build a regex for each category from descriptions
+    # Signal 1: map FLOC type-codes to categories (1 LLM call)
+    floc_code_map = _build_floc_code_map(
+        work["functional_location"],
+        preferred or [],
+        machine_hint or "",
+        model=model,
+    )
+
+    # Signal 2: build description regexes (1 LLM call)
     all_descs = work["description"].tolist()
-    category_patterns = ai_build_category_regexes(
+    desc_patterns = ai_build_category_regexes(
         all_descs,
         preferred or [],
         machine_hint or "",
         model=model,
     )
 
-    # Apply regexes deterministically to every row
-    stats = classify_by_regex(work, category_patterns, desc_col="description")
+    # Apply both signals: FLOC first, description fallback
+    stats = classify_two_signal(
+        work, floc_code_map, desc_patterns,
+        floc_col="functional_location", desc_col="description",
+    )
 
     # Final safety: mechanism enum always valid
     for i in work.index:

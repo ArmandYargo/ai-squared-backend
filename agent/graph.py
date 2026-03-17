@@ -22,6 +22,8 @@ from agent.ram_simulation_tool import run_ram_simulation_archived
 from agent.rag import RagStore
 from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
 
+_sim_progress_store: Optional[Dict[str, Dict[str, Any]]] = None
+
 
 # -------------------------
 # OpenAI helper
@@ -486,6 +488,41 @@ def _default_dates_from_input_sheet(xlsx_path: str):
         return None, None
 
 
+def _read_input_sheets(xlsx_path: str) -> Dict[str, Any]:
+    xl = pd.ExcelFile(xlsx_path)
+    sheets: Dict[str, Any] = {}
+    for name in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name=name)
+        rows = []
+        for _, row in df.iterrows():
+            r: Dict[str, Any] = {}
+            for col in df.columns:
+                val = row[col]
+                if pd.isna(val):
+                    r[col] = ""
+                elif hasattr(val, "isoformat"):
+                    r[col] = val.isoformat()
+                else:
+                    r[col] = val
+            rows.append(r)
+        sheets[name] = {
+            "columns": df.columns.tolist(),
+            "rows": rows,
+        }
+    return sheets
+
+
+def _write_input_sheets(xlsx_path: str, sheets_data: Dict[str, Any]) -> None:
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        for sheet_name, sheet_info in sheets_data.items():
+            cols = sheet_info["columns"]
+            rows = sheet_info["rows"]
+            df = pd.DataFrame(rows, columns=cols)
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="ignore")
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
 def _pick_excel_file_dialog() -> Optional[str]:
     try:
         import tkinter as tk
@@ -512,29 +549,36 @@ def _pick_excel_file_dialog() -> Optional[str]:
 
 
 def _format_readiness_summary(readiness_payload: Dict[str, Any]) -> str:
-    subset_rows = readiness_payload.get("subset_rows")
+    subset_rows = readiness_payload.get("subset_rows", 0)
     readiness = readiness_payload.get("readiness") or {}
     ok = readiness.get("ok_to_simulate", None)
+    metrics = readiness.get("metrics") or {}
+    threshold = readiness.get("min_coverage_threshold", 0.5)
+    essentials = readiness.get("essentials") or []
+    message = readiness.get("message", "")
 
-    interesting_keys = [
-        "ok_to_simulate",
-        "coverage",
-        "mapping_coverage",
-        "reason",
-        "notes",
-        "missing_required_fields",
-        "issues",
-        "warnings",
-    ]
-    lines = []
+    lines: List[str] = []
     lines.append(f"- Rows matched for machine: {subset_rows}")
-    lines.append(f"- OK to simulate?: {ok}")
+    lines.append(f"- OK to simulate: {'Yes' if ok else 'No'}")
 
-    for k in interesting_keys:
-        if k in readiness and k not in {"ok_to_simulate"}:
-            v = readiness.get(k)
-            if v not in (None, "", [], {}, False):
-                lines.append(f"- {k}: {v}")
+    if metrics:
+        lines.append(f"\nField coverage (minimum required: {threshold:.0%}):")
+        for field, cov in metrics.items():
+            pct = f"{cov:.0%}" if isinstance(cov, (int, float)) else str(cov)
+            status = "PASS" if isinstance(cov, (int, float)) and cov >= threshold else "FAIL"
+            lines.append(f"  - {field}: {pct} [{status}]")
+
+    if not ok:
+        failing = [
+            f for f in essentials
+            if f in metrics and isinstance(metrics[f], (int, float)) and metrics[f] < threshold
+        ]
+        if failing:
+            lines.append(f"\nInsufficient data for: {', '.join(failing)}")
+        if subset_rows == 0:
+            lines.append("No work-order rows matched this machine. Check the machine name or upload a different file.")
+        if message:
+            lines.append(f"\n{message}")
 
     return "Data Readiness Check:\n" + "\n".join(lines)
 
@@ -658,34 +702,34 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         _wizard_reply(
             state,
             "What maintenance practice is currently used on this machine?\n"
-            "1. Reactive\n"
-            "2. Corrective\n"
-            "3. Preventative\n"
-            "4. Condition based\n\n"
+            "0. Reactive\n"
+            "1. Corrective\n"
+            "2. Preventative\n"
+            "3. Condition based\n\n"
             "Type the number or name of the practice."
         )
         return state
 
     _MAINT_PRACTICE_MAP = {
-        "1": 0, "reactive": 0,
-        "2": 1, "corrective": 1,
-        "3": 2, "preventative": 2, "preventive": 2,
-        "4": 3, "condition based": 3, "condition-based": 3, "cbm": 3,
+        "0": 0, "reactive": 0,
+        "1": 1, "corrective": 1,
+        "2": 2, "preventative": 2, "preventive": 2,
+        "3": 3, "condition based": 3, "condition-based": 3, "cbm": 3,
     }
 
     if wiz["step"] == "maintenance_practice":
         if not user_text_stripped:
-            _wizard_reply(state, "Please select a maintenance practice (1-4).")
+            _wizard_reply(state, "Please select a maintenance practice (0-3).")
             return state
         key = user_lower.strip()
         if key not in _MAINT_PRACTICE_MAP:
             _wizard_reply(
                 state,
                 "Unrecognised option. Please type one of:\n"
-                "1. Reactive\n"
-                "2. Corrective\n"
-                "3. Preventative\n"
-                "4. Condition based"
+                "0. Reactive\n"
+                "1. Corrective\n"
+                "2. Preventative\n"
+                "3. Condition based"
             )
             return state
         wiz["maintenance_practice"] = _MAINT_PRACTICE_MAP[key]
@@ -755,14 +799,23 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         wiz["readiness_payload"] = payload
-        _wizard_reply(
-            state,
-            _format_readiness_summary(payload)
-            + "\n\nProceed with this file?\n"
-              "- yes (continue)\n"
-              "- upload new (go back and upload another workbook)\n"
-              "- cancel"
-        )
+        readiness_ok = (payload.get("readiness") or {}).get("ok_to_simulate", False)
+        if readiness_ok:
+            prompt_suffix = (
+                "\n\nProceed with this file?\n"
+                "- yes (continue)\n"
+                "- upload new (go back and upload another workbook)\n"
+                "- cancel"
+            )
+        else:
+            prompt_suffix = (
+                "\n\nThe data does not fully meet the requirements. You can still proceed, "
+                "but results may be unreliable.\n"
+                "- yes (proceed anyway)\n"
+                "- upload new (go back and upload another workbook)\n"
+                "- cancel"
+            )
+        _wizard_reply(state, _format_readiness_summary(payload) + prompt_suffix)
         wiz["step"] = "readiness_confirm"
         return state
 
@@ -809,9 +862,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         default_name = _PRACTICE_CODE_TO_NAME.get(default_code, "Reactive")
         _wizard_reply(
             state,
-            f"Categories accepted.\n\n"
-            f"Component maintenance practices (default: {default_name}):\n"
-            f"{_format_component_practices(cats, practices)}\n\n"
+            f"Categories accepted. Default maintenance practice: {default_name}\n\n"
             "Happy with these maintenance practices? (y/n)",
             wizard_ui={
                 "type": "maintenance_table",
@@ -919,11 +970,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             practices = wiz.get("component_practices") or {}
             _wizard_reply(
                 state,
-                "Edit maintenance practices:\n"
-                "Type 'all: [practice]' to change all components, or\n"
-                "list specific changes like '1:0, 3:2'\n\n"
-                "0 = Reactive, 1 = Corrective, 2 = Preventative, 3 = Condition based\n\n"
-                f"{_format_component_practices(cats, practices)}",
+                "Edit maintenance practices using the table below, then click Save.",
                 wizard_ui={
                     "type": "maintenance_table",
                     "categories": cats,
@@ -991,9 +1038,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["step"] = "maintenance_review"
         _wizard_reply(
             state,
-            "Updated maintenance practices:\n"
-            f"{_format_component_practices(cats, practices)}\n\n"
-            "Happy with these maintenance practices? (y/n)",
+            "Updated maintenance practices.\n\nHappy with these? (y/n)",
             wizard_ui={
                 "type": "maintenance_table",
                 "categories": cats,
@@ -1040,15 +1085,25 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         wiz["readiness_payload"] = outputs.get("readiness")
         wiz["ram_input_ready_for_review"] = True
 
+        sheet_data = {}
+        try:
+            sheet_data = _read_input_sheets(ram_input_path)
+        except Exception:
+            pass
+
         _wizard_reply(
             state,
             "RAM input sheet created.\n"
             f"- source workbook: {wiz.get('source_artifact_title') or wiz.get('excel_path')}\n"
             f"- RAM input path: {ram_input_path}\n\n"
-            "The generated RAM input sheet is now saved as an artifact and can be downloaded.\n"
             "Reply with:\n"
             "- simulate (continue with this generated input sheet)\n"
-            "- upload edited (upload an edited input sheet, then type continue)"
+            "- view & edit (review and edit the input sheet in chat)",
+            wizard_ui={
+                "type": "input_sheet_editor",
+                "sheets": sheet_data,
+                "editable": False,
+            } if sheet_data else None,
         )
         wiz["step"] = "input_review"
         return state
@@ -1059,33 +1114,50 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             _wizard_reply(state, "Proceed to RAM simulation using the current input sheet? (yes/no)")
             return state
 
-        if user_lower in {"upload edited", "edited", "edit"}:
-            wiz["step"] = "awaiting_edited_input"
-            _wizard_reply(state, "Okay — upload the edited RAM input sheet, then type 'continue'.")
+        if user_lower in {"view & edit", "view and edit", "edit", "view", "review"}:
+            xlsx = wiz.get("ram_input_path") or ""
+            sheet_data = {}
+            try:
+                sheet_data = _read_input_sheets(xlsx)
+            except Exception as e:
+                _wizard_reply(state, f"Could not read input sheet for editing: {e}")
+                return state
+            wiz["step"] = "input_sheet_edit"
+            _wizard_reply(
+                state,
+                "Edit the input sheet below. Click Save when done.",
+                wizard_ui={
+                    "type": "input_sheet_editor",
+                    "sheets": sheet_data,
+                    "editable": True,
+                },
+            )
             return state
 
-        _wizard_reply(state, "Reply with 'simulate' or 'upload edited'.")
+        _wizard_reply(state, "Reply with 'simulate' or 'view & edit'.")
         return state
 
-    if wiz["step"] == "awaiting_edited_input":
-        if user_lower != "continue":
-            _wizard_reply(state, "Upload the edited RAM input sheet, then type 'continue'.")
+    if wiz["step"] == "input_sheet_edit":
+        if user_text_stripped.startswith("__SHEET_SAVE__:"):
+            json_str = user_text_stripped[len("__SHEET_SAVE__:"):]
+            try:
+                payload = json.loads(json_str)
+                sheets_data = payload.get("sheets") or payload
+                xlsx = wiz.get("ram_input_path") or ""
+                _write_input_sheets(xlsx, sheets_data)
+            except Exception as e:
+                _wizard_reply(state, f"Failed to save edits: {type(e).__name__}: {e}")
+                return state
+
+            wiz["step"] = "sim_confirm"
+            _wizard_reply(
+                state,
+                "Input sheet updated successfully.\n"
+                "Proceed to RAM simulation? (yes/no)"
+            )
             return state
 
-        latest_uploaded = _latest_uploaded_excel_for_simulation(state, wiz.get("source_artifact_id"))
-        if not latest_uploaded:
-            _wizard_reply(state, "I could not find a newly uploaded edited input sheet in this conversation yet.")
-            return state
-
-        wiz["ram_input_path"] = latest_uploaded.get("storage_key")
-        wiz["source_artifact_id"] = latest_uploaded.get("id")
-        wiz["source_artifact_title"] = latest_uploaded.get("title")
-        wiz["step"] = "sim_confirm"
-        _wizard_reply(
-            state,
-            f"Using edited uploaded input sheet: {wiz['source_artifact_title']}\n"
-            "Proceed to RAM simulation? (yes/no)"
-        )
+        _wizard_reply(state, "Use the table editor above to make changes, then click Save.")
         return state
 
     if wiz["step"] == "sim_confirm":
@@ -1162,6 +1234,11 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             end = _parse_date_yyyy_mm_dd(wiz.get("sim_end") or "")
             sims = int(wiz.get("simulations") or 200)
 
+            conv_id = state.get("_conversation_id") or ""
+            def _progress_cb(info: dict) -> None:
+                if _sim_progress_store is not None and conv_id:
+                    _sim_progress_store[conv_id] = info
+
             archive = run_ram_simulation_archived(
                 input_xlsx=wiz.get("ram_input_path") or "",
                 start_date=start,
@@ -1172,6 +1249,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 spare_ind=int(os.environ.get("RAM_SPARES", "0")),
                 out_root=os.environ.get("RAM_RUNS_DIR", "ram_runs"),
                 machine_label=wiz.get("machine"),
+                progress_callback=_progress_cb,
             )
         except Exception as e:
             _wizard_reply(

@@ -235,6 +235,7 @@ def run_ram_simulation_archived(
     spare_ind: int = 0,
     out_root: str = "ram_runs",
     machine_label: Optional[str] = None,
+    progress_callback: Optional[Any] = None,
 ) -> RamSimArchiveResult:
     """
     Runs ram_module.RAM_Simulation_Model.run_ram_simulation(...) and archives results.
@@ -299,6 +300,7 @@ def run_ram_simulation_archived(
             agg_param=agg,
             opp_dt_ind_param=int(opp_dt_ind),
             spare_ind_param=int(spare_ind),
+            progress_callback=progress_callback,
         )
     except TypeError as e:
         msg = str(e)

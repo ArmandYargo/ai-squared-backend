@@ -114,7 +114,7 @@ spare_ind = None
 
 
 
-def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simulations_param=2, agg_param='50th_perc', opp_dt_ind_param=0, spare_ind_param=0):
+def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simulations_param=2, agg_param='50th_perc', opp_dt_ind_param=0, spare_ind_param=0, progress_callback=None):
     """
     Run the RAM simulation with standardized parameters and return organized outputs.
     
@@ -246,6 +246,13 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
         _pbar.set_postfix_str(
             f"{_avg_per_sim:.2f}s/sim | ETA {_remaining:.0f}s"
         )
+        if progress_callback:
+            progress_callback({
+                "current": j + 1,
+                "total": simulations,
+                "avg_per_sim": round(_avg_per_sim, 2),
+                "eta_seconds": round(_remaining, 1),
+            })
     _pbar.close()
 
     _sim_wall_end = _time_mod.perf_counter()

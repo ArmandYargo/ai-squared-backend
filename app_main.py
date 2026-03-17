@@ -6,6 +6,7 @@ import hmac
 import base64
 import hashlib
 import traceback
+from datetime import date as _date_today_cls
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,7 +55,11 @@ app.add_middleware(
 )
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+SIM_PROGRESS: Dict[str, Dict[str, Any]] = {}
 GRAPH = get_graph()
+
+import agent.graph as _agent_graph_mod
+_agent_graph_mod._sim_progress_store = SIM_PROGRESS
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -275,6 +280,49 @@ def _extract_text_from_path(path_str: str, mime_type: Optional[str] = None) -> T
         return False, f"[Unsupported file type for extraction: {suffix or mime_type or 'unknown'}]"
     except Exception as e:
         return False, f"[Failed to extract text: {type(e).__name__}: {e}]"
+
+
+_INTENT_LABELS = {
+    "ram_wizard": "RAM Wizard",
+    "qa": "Q&A",
+    "rag": "RAG Q&A",
+}
+
+
+def _build_conversation_title(
+    out: Dict[str, Any],
+    conv: Optional[Dict[str, Any]],
+    user_message: str,
+) -> str:
+    """
+    Build a rich conversation title from wizard state.
+    Format: "YYYY-MM-DD | Agent Label | Machine Type"
+    Falls back to date + summarised first message if no wizard context.
+    The title upgrades as more context becomes available (machine type, etc.).
+    """
+    today = _date_today_cls.today().isoformat()
+    wiz = out.get("ram_wizard") or {}
+    intent = out.get("intent", "qa")
+    agent_label = _INTENT_LABELS.get(intent, intent)
+    machine = wiz.get("machine")
+    existing_title = conv.get("title") if conv else None
+
+    best = None
+    if machine:
+        best = f"{today} | {agent_label} | {machine}"
+    elif wiz.get("active"):
+        best = f"{today} | {agent_label}"
+
+    if best:
+        return best
+
+    if existing_title and " | " in existing_title:
+        return existing_title
+
+    summary = user_message[:50].strip()
+    if len(user_message) > 50:
+        summary += "…"
+    return f"{today} | {agent_label} | {summary}"
 
 
 def _build_artifact_context_for_conversation(conversation_id: str, artifact_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -795,8 +843,10 @@ def chat(req: ChatRequest, request: Request):
             },
         )
 
+        state["_conversation_id"] = conversation_id
         out = GRAPH.invoke(state, config={"configurable": {"thread_id": conversation_id}})  # type: ignore[arg-type]
         SESSIONS[conversation_id] = out
+        SIM_PROGRESS.pop(conversation_id, None)
 
         created_output_types = _persist_generated_ram_artifacts(
             conversation_id=conversation_id,
@@ -839,9 +889,7 @@ def chat(req: ChatRequest, request: Request):
             },
         )
 
-        title = conv.get("title") if conv else None
-        if not title:
-            title = req.message[:60].strip()
+        title = _build_conversation_title(out, conv, req.message)
 
         update_conversation_after_turn(
             conversation_id=conversation_id,
@@ -981,6 +1029,12 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+@app.get("/api/progress/{conversation_id}")
+def get_progress(conversation_id: str, request: Request):
+    _require_auth(request)
+    return SIM_PROGRESS.get(conversation_id, {})
+
+
 @app.post("/api/reset")
 def reset_session(
     request: Request,
@@ -992,4 +1046,5 @@ def reset_session(
     key = conversation_id or session_id
     if key and key in SESSIONS:
         del SESSIONS[key]
+    SIM_PROGRESS.pop(key or "", None)
     return {"ok": True, "conversation_id": key}

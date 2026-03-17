@@ -280,6 +280,13 @@ def run_ram_simulation(input_xlsx_param, start_date_param, end_date_param, simul
         f"Prediction error: {_sign}{_pred_err:.1f}%\n"
     )
 
+    if progress_callback:
+        progress_callback({
+            "step": "aggregation",
+            "message": "Aggregating simulation results...",
+            "est_seconds": 10,
+        })
+
     ## Manipulate/aggregate results
 
     #create dataframes for each component i and simulation j

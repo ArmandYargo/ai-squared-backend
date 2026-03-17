@@ -211,11 +211,19 @@ def run_ram_pipeline(
     match_scope: str = "both",
     outputs_dir: str | Path = "outputs",
     latest_name: str = "ram_input_sheet.xlsx",
+    progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     outputs_dir = Path(outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     log_lines: List[str] = []
+
+    def _emit(substep: str, message: str, est_seconds: Optional[int] = None):
+        if progress_callback is not None:
+            info: Dict[str, Any] = {"step": "classification", "substep": substep, "message": message}
+            if est_seconds is not None:
+                info["est_seconds"] = est_seconds
+            progress_callback(info)
 
     def log(msg: str):
         log_lines.append(msg)
@@ -238,12 +246,14 @@ def run_ram_pipeline(
     log(f"✅ File selected: {excel_name}")
 
     # Step 2/7: ingest workbook
+    _emit("ingest", "Step 2/7: Ingesting workbook and mapping columns...", est_seconds=45)
     log("Step 2/7: Ingest workbook + decide column mapping…")
     df_master, report = ingest_cmms_workbook(excel_path, model=model, min_coverage=min_coverage)
     mapping = report["mapping"]
     log("✅ Ingest complete.")
 
     # Step 3/7: readiness check
+    _emit("readiness", "Step 3/7: Assessing data readiness...", est_seconds=35)
     log("Step 3/7: Assess readiness for selected machine scope…")
     df_subset, readiness, filt_meta = assess_ram_readiness_for_machine(
         df_master,
@@ -257,6 +267,7 @@ def run_ram_pipeline(
     log(f"✅ Readiness check complete. OK to simulate?: {ok_to_simulate}")
 
     # Step 4/7: apply date filter
+    _emit("date_filter", "Step 4/7: Applying date filter...", est_seconds=30)
     log(f"Step 4/7: Apply date filter: {date_range_text or '(none)'}")
     df_filtered, date_meta = _apply_date_filter(df_subset, mapping, date_range_text)
     if date_meta.get("skipped"):
@@ -264,6 +275,7 @@ def run_ram_pipeline(
     log(f"✅ Rows after filter: {len(df_filtered)}")
 
     # Step 5/7: categories
+    _emit("categories", "Step 5/7: Preparing breakdown categories...", est_seconds=25)
     log("Step 5/7: Prepare coarse breakdown categories…")
     if preferred_categories is None:
         preferred_categories = ai_propose_components_coarse(machine, model=model)
@@ -275,6 +287,7 @@ def run_ram_pipeline(
     _SECS_PER_ROW = 2.3
     _num_rows = len(df_filtered)
     _est_secs = _num_rows * _SECS_PER_ROW
+    _emit("classify", f"Step 6/7: Classifying {_num_rows} work-order rows...", est_seconds=int(_est_secs))
     log("Step 6/7: Classify work-order rows into components (this can take a bit)…")
     log(f"   Estimated time: ~{_est_secs:.0f}s (based on {_num_rows} rows @ ~{_SECS_PER_ROW}s/row)")
 
@@ -332,6 +345,7 @@ def run_ram_pipeline(
         pass
 
     # Step 7/7: Build RAM input workbook (using func_inputsheet correctly)
+    _emit("build_input", "Step 7/7: Building RAM input workbook...", est_seconds=10)
     log("Step 7/7: Export RAM input workbook…")
     comp_att = build_comp_att_from_summary(
         summary_df, machine_type=machine, model=model,
@@ -455,6 +469,7 @@ def run_ram_pipeline_compat(**kwargs):
         "match_scope",
         "outputs_dir",
         "latest_name",
+        "progress_callback",
     }
     mapped = {k: v for k, v in mapped.items() if k in allowed}
 

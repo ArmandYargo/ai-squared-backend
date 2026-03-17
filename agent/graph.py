@@ -1092,10 +1092,16 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         conv_id = state.get("_conversation_id") or ""
+
+        def _cls_progress_cb(info: dict) -> None:
+            if _sim_progress_store is not None and conv_id:
+                _sim_progress_store[conv_id] = info
+
         if _sim_progress_store is not None and conv_id:
             _sim_progress_store[conv_id] = {
                 "step": "classification",
-                "message": "Classifying work-order data and building input sheet...",
+                "substep": "starting",
+                "message": "Starting classification pipeline...",
                 "est_seconds": 45,
             }
         try:
@@ -1106,6 +1112,7 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 preferred_categories=wiz.get("categories"),
                 maintenance_practice=wiz.get("maintenance_practice"),
                 component_practices=wiz.get("component_practices"),
+                progress_callback=_cls_progress_cb,
             )
         except Exception as e:
             if _sim_progress_store is not None and conv_id:

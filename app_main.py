@@ -670,6 +670,7 @@ def api_get_conversation(conversation_id: str, request: Request, browser_id: Opt
                 "speaker": m.get("speaker"),
                 "content": m["content"],
                 "created_at": m["created_at"].isoformat() if m.get("created_at") else None,
+                "wizard_ui": (m.get("metadata") or {}).get("wizard_ui"),
             }
             for m in msgs
         ],
@@ -686,24 +687,25 @@ def api_list_artifacts(conversation_id: str, request: Request, browser_id: Optio
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
     rows = list_artifacts(conversation_id)
-    return {
-        "items": [
-            {
-                "id": str(r["id"]),
-                "conversation_id": str(r["conversation_id"]),
-                "run_id": str(r["run_id"]) if r.get("run_id") else None,
-                "output_type": r.get("output_type"),
-                "title": r.get("title"),
-                "storage_provider": r.get("storage_provider"),
-                "storage_key": r.get("storage_key"),
-                "mime_type": r.get("mime_type"),
-                "metadata": r.get("metadata") or {},
-                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
-                "download_url": f"/api/artifacts/{r['id']}/download",
-            }
-            for r in rows
-        ]
-    }
+    items = []
+    for r in rows:
+        sk = r.get("storage_key")
+        file_available = bool(sk and Path(sk).exists() and Path(sk).is_file())
+        items.append({
+            "id": str(r["id"]),
+            "conversation_id": str(r["conversation_id"]),
+            "run_id": str(r["run_id"]) if r.get("run_id") else None,
+            "output_type": r.get("output_type"),
+            "title": r.get("title"),
+            "storage_provider": r.get("storage_provider"),
+            "storage_key": r.get("storage_key"),
+            "mime_type": r.get("mime_type"),
+            "metadata": r.get("metadata") or {},
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            "download_url": f"/api/artifacts/{r['id']}/download",
+            "available": file_available,
+        })
+    return {"items": items}
 
 
 @app.get("/api/artifacts/{artifact_id}/download")
@@ -721,7 +723,11 @@ def api_download_artifact(artifact_id: str, request: Request, browser_id: Option
 
     path = Path(storage_key)
     if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Artifact file not found.")
+        raise HTTPException(
+            status_code=410,
+            detail="File no longer available. Render's free tier uses ephemeral storage — "
+                   "files are lost when the instance restarts. Upgrade to a paid plan for persistent disk.",
+        )
 
     filename = artifact.get("title") or path.name
     media_type = artifact.get("mime_type") or "application/octet-stream"
@@ -816,10 +822,14 @@ def chat(req: ChatRequest, request: Request):
         }
         state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id, artifact_rows=artifact_rows)
 
+        user_display_content = req.message
+        if user_display_content.startswith("__SHEET_SAVE__:"):
+            user_display_content = "Saved input sheet edits"
+
         user_msg_row = insert_message(
             conversation_id=conversation_id,
             role="user",
-            content=req.message,
+            content=user_display_content,
             speaker="USER",
             metadata={
                 "used_artifact_ids": artifact_context_info.get("used_artifact_ids", []),
@@ -875,6 +885,7 @@ def chat(req: ChatRequest, request: Request):
 
         assistant_text = assistant_msg.get("content", "")
         assistant_speaker = assistant_msg.get("speaker", "ASSISTANT")
+        assistant_wizard_ui = assistant_msg.get("wizard_ui")
 
         insert_message(
             conversation_id=conversation_id,
@@ -886,6 +897,7 @@ def chat(req: ChatRequest, request: Request):
                 "used_artifact_titles": artifact_context_info.get("used_artifact_titles", []),
                 "skipped_artifacts": artifact_context_info.get("skipped_artifacts", []),
                 "generated_output_types": created_output_types,
+                "wizard_ui": assistant_wizard_ui,
             },
         )
 
@@ -994,11 +1006,11 @@ async def upload_file(
             title=(conv.get("title") if conv and conv.get("title") else file.filename),
         )
 
-        # Auto-advance wizard if it's waiting on the "file" step
+        # Auto-advance wizard if it's waiting on the "file" or "awaiting_upload_input" step
         auto_reply = None
         state = SESSIONS.get(conversation_id)
         wiz = (state or {}).get("ram_wizard") or {}
-        if state and wiz.get("active") and wiz.get("step") == "file":
+        if state and wiz.get("active") and wiz.get("step") in {"file", "awaiting_upload_input"}:
             state["conversation_artifacts"] = _build_conversation_artifact_inventory(conversation_id)
             state["messages"] = state.get("messages", []) + [
                 {"role": "user", "content": "proceed"}

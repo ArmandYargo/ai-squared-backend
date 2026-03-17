@@ -42,7 +42,7 @@ def check_ram_readiness(
     machine: str,
     *,
     model: str = "gpt-5.2",
-    min_coverage: float = 0.50,
+    min_coverage: float = 0.80,
     match_scope: str = "both",
 ) -> Dict[str, Any]:
     """
@@ -207,7 +207,7 @@ def run_ram_pipeline(
     maintenance_practice: Optional[int] = None,
     component_practices: Optional[Dict[str, int]] = None,
     model: str = "gpt-5.2",
-    min_coverage: float = 0.50,
+    min_coverage: float = 0.80,
     match_scope: str = "both",
     outputs_dir: str | Path = "outputs",
     latest_name: str = "ram_input_sheet.xlsx",

@@ -40,7 +40,7 @@ from func_inputsheet import (
 
 # ---- Config ----
 MODEL = "gpt-5.2"
-MIN_COVERAGE = 0.50
+MIN_COVERAGE = 0.80
 BLANK_RUN = 5
 AGGRESSIVENESS = "assertive"  # 'conservative' | 'balanced' | 'assertive'
 DAYFIRST = True               # interpret ambiguous dates as DD/MM/YYYY

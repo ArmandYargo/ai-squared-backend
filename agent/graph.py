@@ -513,14 +513,35 @@ def _read_input_sheets(xlsx_path: str) -> Dict[str, Any]:
 
 
 def _write_input_sheets(xlsx_path: str, sheets_data: Dict[str, Any]) -> None:
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        for sheet_name, sheet_info in sheets_data.items():
-            cols = sheet_info["columns"]
-            rows = sheet_info["rows"]
-            df = pd.DataFrame(rows, columns=cols)
-            for col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="ignore")
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    from openpyxl import Workbook
+
+    if not sheets_data:
+        raise ValueError("No sheet data to write.")
+
+    wb = Workbook()
+    first_sheet = True
+    for sheet_name, sheet_info in sheets_data.items():
+        cols = sheet_info.get("columns", [])
+        rows = sheet_info.get("rows", [])
+        if first_sheet:
+            ws = wb.active
+            ws.title = sheet_name
+            first_sheet = False
+        else:
+            ws = wb.create_sheet(title=sheet_name)
+        ws.append(cols)
+        for row_data in rows:
+            cell_values = []
+            for c in cols:
+                val = row_data.get(c, "")
+                if val != "" and val is not None:
+                    try:
+                        val = pd.to_numeric(val)
+                    except (ValueError, TypeError):
+                        pass
+                cell_values.append(val)
+            ws.append(cell_values)
+    wb.save(xlsx_path)
 
 
 def _pick_excel_file_dialog() -> Optional[str]:
@@ -553,7 +574,7 @@ def _format_readiness_summary(readiness_payload: Dict[str, Any]) -> str:
     readiness = readiness_payload.get("readiness") or {}
     ok = readiness.get("ok_to_simulate", None)
     metrics = readiness.get("metrics") or {}
-    threshold = readiness.get("min_coverage_threshold", 0.5)
+    threshold = readiness.get("min_coverage_threshold", 0.8)
     essentials = readiness.get("essentials") or []
     message = readiness.get("message", "")
 
@@ -1098,7 +1119,8 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             f"- RAM input path: {ram_input_path}\n\n"
             "Reply with:\n"
             "- simulate (continue with this generated input sheet)\n"
-            "- view & edit (review and edit the input sheet in chat)",
+            "- edit (review and edit the input sheet in chat)\n"
+            "- upload (use a previously saved input sheet instead)",
             wizard_ui={
                 "type": "input_sheet_editor",
                 "sheets": sheet_data,
@@ -1134,7 +1156,16 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             )
             return state
 
-        _wizard_reply(state, "Reply with 'simulate' or 'view & edit'.")
+        if user_lower in {"upload", "upload file", "upload sheet"}:
+            wiz["step"] = "awaiting_upload_input"
+            _wizard_reply(
+                state,
+                "Upload your RAM input sheet (.xlsx) using the file upload button.\n"
+                "It will replace the current generated sheet."
+            )
+            return state
+
+        _wizard_reply(state, "Reply with 'simulate', 'edit', or 'upload'.")
         return state
 
     if wiz["step"] == "input_sheet_edit":
@@ -1146,7 +1177,15 @@ def node_ram_wizard(state: AgentState) -> AgentState:
                 xlsx = wiz.get("ram_input_path") or ""
                 _write_input_sheets(xlsx, sheets_data)
             except Exception as e:
-                _wizard_reply(state, f"Failed to save edits: {type(e).__name__}: {e}")
+                wiz["step"] = "input_review"
+                _wizard_reply(
+                    state,
+                    f"Failed to save edits: {type(e).__name__}: {e}\n\n"
+                    "You can:\n"
+                    "- edit (try editing again)\n"
+                    "- upload (upload a saved input sheet instead)\n"
+                    "- simulate (proceed with the original sheet)"
+                )
                 return state
 
             wiz["step"] = "sim_confirm"
@@ -1158,6 +1197,46 @@ def node_ram_wizard(state: AgentState) -> AgentState:
             return state
 
         _wizard_reply(state, "Use the table editor above to make changes, then click Save.")
+        return state
+
+    if wiz["step"] == "awaiting_upload_input":
+        artifacts = state.get("conversation_artifacts") or []
+        xlsx_artifacts = [
+            a for a in artifacts
+            if (a.get("mime_type") or "").startswith("application/vnd.openxmlformats")
+            or (a.get("title") or "").lower().endswith(".xlsx")
+        ]
+        latest = xlsx_artifacts[-1] if xlsx_artifacts else None
+        if latest and latest.get("storage_key"):
+            uploaded_path = latest["storage_key"]
+            wiz["ram_input_path"] = uploaded_path
+            sheet_data = {}
+            try:
+                sheet_data = _read_input_sheets(uploaded_path)
+            except Exception:
+                pass
+            wiz["step"] = "input_review"
+            _wizard_reply(
+                state,
+                f"Using uploaded input sheet: {latest.get('title', uploaded_path)}\n\n"
+                "Reply with:\n"
+                "- simulate (continue with this input sheet)\n"
+                "- edit (review and edit the input sheet in chat)",
+                wizard_ui={
+                    "type": "input_sheet_editor",
+                    "sheets": sheet_data,
+                    "editable": False,
+                } if sheet_data else None,
+            )
+            return state
+
+        _wizard_reply(
+            state,
+            "No uploaded input sheet found. Please upload an .xlsx file using the file upload button,\n"
+            "or type 'edit' to go back to editing, or 'simulate' to use the current sheet."
+        )
+        if user_lower in {"edit", "simulate"}:
+            wiz["step"] = "input_review"
         return state
 
     if wiz["step"] == "sim_confirm":

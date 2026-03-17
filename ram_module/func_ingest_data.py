@@ -280,7 +280,7 @@ def assess_ram_readiness(
     floc_col: Optional[str],
     desc_col: Optional[str],
     duration_col: Optional[str] = "breakdown_duration_hours",
-    min_coverage: float = 0.50,
+    min_coverage: float = 0.80,
 ) -> Dict:
     """
     Computes coverage for essential RAM inputs on the given dataframe and returns pass/fail.
@@ -332,7 +332,7 @@ def ingest_cmms_workbook(
     path: str,
     *,
     model: str = "gpt-5.2",
-    min_coverage: float = 0.50,
+    min_coverage: float = 0.80,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     High-level ingest:
@@ -502,7 +502,7 @@ def assess_ram_readiness_for_machine(
     machine_query: str,
     *,
     model: str = "gpt-5.2",
-    min_coverage: float = 0.50,
+    min_coverage: float = 0.80,
     match_scope: str = "floc",   # 'floc' | 'desc' | 'both'
 ) -> Tuple[pd.DataFrame, Dict, Dict]:
     """

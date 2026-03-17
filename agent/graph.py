@@ -740,12 +740,10 @@ def node_ram_wizard(state: AgentState) -> AgentState:
         except Exception as e:
             answer = f"Sorry, I couldn't answer that right now: {type(e).__name__}: {e}"
 
-        state.setdefault("messages", []).append(
-            {"role": "assistant", "content": answer, "speaker": "LLM"}
-        )
         last_prompt = wiz.get("_last_prompt") or "Please continue with the wizard step above."
         last_ui = wiz.get("_last_wizard_ui")
-        _wizard_reply(state, f"Returning to the wizard (step: {wiz.get('step')}):\n\n{last_prompt}", wizard_ui=last_ui)
+        combined = f"{answer}\n\n---\n\n**Returning to wizard:**\n{last_prompt}"
+        _wizard_reply(state, combined, wizard_ui=last_ui)
         return state
 
     if wiz["step"] == "machine":

@@ -17,7 +17,7 @@ if str(RAM_MODULE_DIR) not in sys.path:
 
 from func_ingest_data import ingest_cmms_workbook, assess_ram_readiness_for_machine
 from func_define_components import ai_propose_components_coarse, ai_apply_edit_to_components
-from func_classify_data import step4_with_query
+from func_classify_data import step4_with_query, step4_process
 from func_analyse_data import analyse_and_append_to_excel  # IMPORTANT: signature is (classified_df, excel_path, ...)
 from func_date_filter import extract_dates_and_update_output  # used only for stamping, best-effort
 
@@ -292,11 +292,17 @@ def run_ram_pipeline(
     log(f"   Estimated time: ~{_est_secs:.0f}s (based on {_num_rows} rows @ ~{_SECS_PER_ROW}s/row)")
 
     _cls_t0 = _time_mod.perf_counter()
-    # IMPORTANT: your step4_with_query does NOT accept mapping=...
-    classified_df, mapping2, end_row, stats, meta = step4_with_query(
+    # Use step4_process directly with NO machine filter — df_filtered is
+    # already filtered to the correct machine subset (Step 3).  Calling
+    # step4_with_query would generate a SECOND independent AI regex and
+    # re-filter, discarding most rows.
+    classified_df, mapping2, end_row, stats = step4_process(
         df_filtered,
-        machine,
         model=model,
+        machine_include=None,
+        machine_exclude=None,
+        require_match=False,
+        machine_hint=machine,
         preferred_categories=preferred_categories,
     )
     _cls_t1 = _time_mod.perf_counter()

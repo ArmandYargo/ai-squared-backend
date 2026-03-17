@@ -424,16 +424,16 @@ def _build_floc_code_map(
     """
     raw_flocs = floc_series.dropna().astype(str).unique().tolist()
 
-    codes: List[str] = []
+    # Extract all 2-4 letter uppercase alpha segments from FLOCs.
+    # These contain equipment type codes (BET, ELE, CHU, IDL, PNL, etc.)
+    alpha_segments: set = set()
     for f in raw_flocs:
-        parts = f.split("-")
-        for i in range(len(parts) - 1, 0, -1):
-            candidate = "-".join(parts[i:])
-            if any(c.isalpha() for c in candidate):
-                codes.append(candidate)
-                break
+        for part in f.split("-"):
+            cleaned = part.strip().upper()
+            if cleaned.isalpha() and 2 <= len(cleaned) <= 4:
+                alpha_segments.add(cleaned)
 
-    unique_codes = sorted(set(codes))[:80]
+    unique_codes = sorted(alpha_segments)[:60]
     if not unique_codes:
         return {}
 
@@ -467,19 +467,22 @@ def _build_floc_code_map(
         "role": "user",
         "content": (
             f"{_DOMAIN_LINE}\n"
-            "I have equipment FLOC (Functional Location) type-codes from SAP and a set of "
-            "coarse breakdown categories.  Map each code to the BEST matching category.\n\n"
-            "Common SAP FLOC naming conventions:\n"
-            "- BET = belt, PUL = pulley, IDL = idler, DRV/DRI = drive\n"
+            "I have short alpha codes extracted from SAP Functional Location (FLOC) strings.  "
+            "These codes identify equipment types.  Map each EQUIPMENT code to the BEST "
+            "matching breakdown category.  Codes that are NOT equipment identifiers "
+            "(e.g., plant/area/section codes like ECG, CRP, CNV, PHP, SKP, LDP, SRP, WHP, CNP) "
+            "should be mapped to 'other'.\n\n"
+            "Common SAP equipment type codes:\n"
+            "- BET = belt, PUL = pulley, IDL = idler, DRV = drive, CPL = coupling\n"
             "- ELE/ELC = electrical, PNL = panel, SWH = switch, MOT = motor\n"
             "- CHU = chute, SCA = scraper, STR/STL = structure\n"
-            "- INE/INS = instrumentation, TSM = transmitter, DTE = detector, MET = meter\n"
+            "- INE/INS = instrumentation, TSM = transmitter, DTE = detector, MET = meter, WGR = weigher\n"
             "- HYD = hydraulic, VLV = valve, GBX = gearbox\n"
-            "- PWR/POW = power_supply\n\n"
-            "If a code does not fit any category, map it to 'other'.\n\n"
+            "- PWR/POW = power_supply, SAP = (system code, use other)\n"
+            "- PIP = piping/structure\n\n"
             f"Machine: {machine_hint}\n"
             f"Categories: {cats_norm}\n"
-            f"FLOC type-codes: {unique_codes}\n\n"
+            f"Codes to map: {unique_codes}\n\n"
             "Return ONLY JSON."
         ),
     }
@@ -619,9 +622,10 @@ def classify_two_signal(
         for code, cat in floc_code_map.items():
             if cat == "other":
                 continue
-            if code.upper() in floc_val:
+            # Match as a FLOC segment: surrounded by dashes (or at start/end)
+            if f"-{code.upper()}-" in f"-{floc_val}-":
                 matched_cat = cat
-                source = f"FLOC code contains '{code}'"
+                source = f"FLOC code '{code}'"
                 stats["floc_matched"] += 1
                 break
 

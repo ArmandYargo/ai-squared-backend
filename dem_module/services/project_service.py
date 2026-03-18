@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 
 def build_default_dem_project() -> Dict[str, Any]:
@@ -10,6 +10,7 @@ def build_default_dem_project() -> Dict[str, Any]:
         "project_id": None,
         "project_name": None,
         "user_goal": None,
+        "application_type": None,
         "geometry_source": None,
         "geometry_files": [],
         "geometry_units": None,
@@ -78,12 +79,17 @@ def build_dem_setup_wizard() -> Dict[str, Any]:
     }
 
 
-def build_dem_project_snapshot(dem: Dict[str, Any]) -> Dict[str, Any]:
+def build_dem_scenario_wizard() -> Dict[str, Any]:
     return {
-        "project_name": dem.get("project_name"),
-        "material_name": dem.get("material_name"),
-        "geometry_source": dem.get("geometry_source"),
-        "geometry_notes": dem.get("geometry_notes"),
-        "run_status": dem.get("run_status"),
-        "scenario_count": len(dem.get("scenarios") or []),
+        "type": "dem_scenario_setup",
+        "editable": True,
+        "fields": [
+            {"key": "scenario_name", "label": "Scenario name", "type": "text"},
+            {"key": "geometry_type", "label": "Geometry type", "type": "text"},
+            {"key": "operating_case", "label": "Operating case", "type": "text"},
+            {"key": "mass_flow_tph", "label": "Mass flow (tph)", "type": "text"},
+            {"key": "belt_speed_mps", "label": "Belt speed (m/s)", "type": "text"},
+            {"key": "geometry_units", "label": "Geometry units", "type": "text"},
+            {"key": "notes", "label": "Scenario notes", "type": "textarea"},
+        ],
     }

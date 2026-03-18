@@ -67,7 +67,7 @@ def ensure_default_scenarios(dem: Dict[str, Any]) -> Dict[str, Any]:
 def build_dem_setup_wizard() -> Dict[str, Any]:
     return {
         "type": "dem_project_setup",
-        "editable": False,
+        "editable": True,
         "fields": [
             {"key": "project_name", "label": "Project name", "type": "text"},
             {"key": "application_type", "label": "Application type", "type": "text"},

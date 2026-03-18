@@ -16,9 +16,11 @@ def build_default_dem_project() -> Dict[str, Any]:
         "geometry_units": None,
         "geometry_validated": False,
         "geometry_notes": "",
+        "geometry_definition": {},
         "material_name": None,
         "material_properties": {},
         "scenarios": [],
+        "config": {},
         "run_requested": False,
         "run_status": "not_started",
         "progress": {},
@@ -91,5 +93,21 @@ def build_dem_scenario_wizard() -> Dict[str, Any]:
             {"key": "belt_speed_mps", "label": "Belt speed (m/s)", "type": "text"},
             {"key": "geometry_units", "label": "Geometry units", "type": "text"},
             {"key": "notes", "label": "Scenario notes", "type": "textarea"},
+        ],
+    }
+
+
+def build_dem_geometry_wizard() -> Dict[str, Any]:
+    return {
+        "type": "dem_geometry_setup",
+        "editable": True,
+        "fields": [
+            {"key": "geometry_mode", "label": "Geometry mode (CAD / parametric)", "type": "text"},
+            {"key": "transfer_length_mm", "label": "Transfer length (mm)", "type": "text"},
+            {"key": "transfer_width_mm", "label": "Transfer width (mm)", "type": "text"},
+            {"key": "drop_height_mm", "label": "Drop height (mm)", "type": "text"},
+            {"key": "wall_angle_deg", "label": "Wall angle (deg)", "type": "text"},
+            {"key": "outlet_width_mm", "label": "Outlet width (mm)", "type": "text"},
+            {"key": "notes", "label": "Geometry notes", "type": "textarea"},
         ],
     }

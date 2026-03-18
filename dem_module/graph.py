@@ -12,9 +12,11 @@ from dem_module.prompts import (
 )
 from dem_module.router import route_dem_request
 from dem_module.state import DEMAgentState
+from dem_module.services.config_service import build_dem_config, summarise_dem_config
 from dem_module.services.project_service import (
     apply_extracted_entities,
     build_default_dem_project,
+    build_dem_geometry_wizard,
     build_dem_scenario_wizard,
     build_dem_setup_wizard,
     ensure_default_scenarios,
@@ -86,6 +88,10 @@ def _is_dem_scenario_submission(user_text: str) -> bool:
     return user_text.startswith("__DEM_SCENARIO__:")
 
 
+def _is_dem_geometry_submission(user_text: str) -> bool:
+    return user_text.startswith("__DEM_GEOMETRY__:")
+
+
 def _parse_json_submission(prefix: str, user_text: str) -> Dict[str, Any]:
     raw = user_text[len(prefix):].strip()
     payload = json.loads(raw)
@@ -140,6 +146,7 @@ def _apply_dem_scenario_submission(dem: Dict[str, Any], payload: Dict[str, Any])
 
     existing = dem.get("scenarios") or []
     dem["scenarios"] = [scenario] + existing
+
     if scenario.get("geometry_units"):
         dem["geometry_units"] = scenario["geometry_units"]
 
@@ -147,7 +154,34 @@ def _apply_dem_scenario_submission(dem: Dict[str, Any], payload: Dict[str, Any])
         dem["geometry_notes"] = f"Geometry type: {scenario['geometry_type']}"
 
     dem["step"] = "scenario_saved"
-    dem["next_action"] = "awaiting_geometry_files_or_manual_geometry_definition"
+    dem["next_action"] = "awaiting_geometry_definition"
+    return dem
+
+
+def _apply_dem_geometry_submission(dem: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    values = payload.get("values", {})
+    if not isinstance(values, dict):
+        raise ValueError("DEM geometry payload is missing a valid 'values' object.")
+
+    geometry_definition = {
+        "geometry_mode": _clean_str(values.get("geometry_mode")),
+        "transfer_length_mm": _clean_float(values.get("transfer_length_mm")),
+        "transfer_width_mm": _clean_float(values.get("transfer_width_mm")),
+        "drop_height_mm": _clean_float(values.get("drop_height_mm")),
+        "wall_angle_deg": _clean_float(values.get("wall_angle_deg")),
+        "outlet_width_mm": _clean_float(values.get("outlet_width_mm")),
+        "notes": _clean_str(values.get("notes")) or "",
+    }
+
+    dem["geometry_definition"] = geometry_definition
+    dem["step"] = "geometry_saved"
+    dem["next_action"] = "ready_for_config_build"
+
+    if geometry_definition.get("notes"):
+        dem["geometry_notes"] = geometry_definition["notes"]
+
+    dem["config"] = build_dem_config(dem)
+
     return dem
 
 
@@ -173,10 +207,20 @@ def _build_scenario_saved_reply(dem: Dict[str, Any]) -> str:
         f"Mass flow: {scenario.get('mass_flow_tph') if scenario.get('mass_flow_tph') is not None else 'Not set'}\n"
         f"Belt speed: {scenario.get('belt_speed_mps') if scenario.get('belt_speed_mps') is not None else 'Not set'}\n"
         f"Geometry units: {scenario.get('geometry_units') or 'Not set'}\n\n"
-        "Next step:\n"
-        "- upload CAD/mesh files if you have them, or\n"
-        "- describe the transfer geometry in plain English so I can build a first parametric model."
+        "Next, define the transfer geometry."
     )
+
+
+def _build_geometry_saved_reply(dem: Dict[str, Any]) -> str:
+    base = (
+        "DEM geometry saved.\n\n"
+        "The DEM intake workflow now has:\n"
+        "- project setup\n"
+        "- first scenario\n"
+        "- geometry definition\n\n"
+    )
+    config_summary = summarise_dem_config(dem.get("config") or {})
+    return base + config_summary
 
 
 def handle_dem_turn(state: DEMAgentState) -> DEMAgentState:
@@ -207,12 +251,29 @@ def handle_dem_turn(state: DEMAgentState) -> DEMAgentState:
         try:
             payload = _parse_json_submission("__DEM_SCENARIO__:", user_text)
             dem = _apply_dem_scenario_submission(dem, payload)
-            _append_assistant_message(state, _build_scenario_saved_reply(dem))
+            _append_assistant_message(
+                state,
+                _build_scenario_saved_reply(dem),
+                wizard_ui=build_dem_geometry_wizard(),
+            )
             return state
         except Exception as exc:
             _append_assistant_message(
                 state,
                 f"I could not save the DEM scenario form because the payload was invalid. Error: {exc}"
+            )
+            return state
+
+    if _is_dem_geometry_submission(user_text):
+        try:
+            payload = _parse_json_submission("__DEM_GEOMETRY__:", user_text)
+            dem = _apply_dem_geometry_submission(dem, payload)
+            _append_assistant_message(state, _build_geometry_saved_reply(dem))
+            return state
+        except Exception as exc:
+            _append_assistant_message(
+                state,
+                f"I could not save the DEM geometry form because the payload was invalid. Error: {exc}"
             )
             return state
 
@@ -231,7 +292,7 @@ def handle_dem_turn(state: DEMAgentState) -> DEMAgentState:
         return state
 
     if intent == "dem_geometry":
-        _append_assistant_message(state, DEM_GEOMETRY_PROMPT)
+        _append_assistant_message(state, DEM_GEOMETRY_PROMPT, wizard_ui=build_dem_geometry_wizard())
         return state
 
     if intent == "dem_results":

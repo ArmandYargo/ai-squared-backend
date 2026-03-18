@@ -17,8 +17,6 @@ except Exception:
     SqliteSaver = None
 
 from agent.state import AgentState
-from dem_module.intents import is_dem_related
-from dem_module.graph import handle_dem_turn
 from agent.ram_tool import run_ram_pipeline_compat, check_ram_readiness
 from agent.ram_simulation_tool import run_ram_simulation_archived
 from agent.rag import RagStore
@@ -207,7 +205,7 @@ def _artifact_prompt_hint(state: AgentState) -> str:
 # -------------------------
 # AI Router helper
 # -------------------------
-_ALLOWED_INTENTS = ("qa", "ram_wizard", "dem")
+_ALLOWED_INTENTS = ("qa", "ram_wizard")
 
 
 def _safe_json_from_text(text: str) -> dict:
@@ -259,21 +257,17 @@ def _looks_like_ram_start(text: str) -> bool:
 
 def _route_intent_ai(user_text: str, wiz_active: bool) -> dict:
     system = (
-        "You are an intent router for an engineering assistant for mines/factories.\n"
+        "You are an intent router for a reliability engineering assistant for mines/factories.\n"
         "Choose the single best intent for the user's message.\n\n"
         "Allowed intents:\n"
         "- qa: user is asking a question or wants explanation/advice\n"
         "- ram_wizard: user wants to create/continue the RAM input sheet workflow, provide required wizard input, "
-        "or proceed with simulation steps\n"
-        "- dem: user wants help with DEM, particle simulation, PyChrono, chute/transfer modelling, "
-        "geometry setup, bulk solids flow, or DEM results\n\n"
+        "or proceed with simulation steps.\n\n"
         "Rules:\n"
         "- If the user asks about an uploaded file, document, summary, comparison, or attached material, choose qa.\n"
-        "- If the user wants to build an input sheet, run RAM, continue a RAM wizard, review an input sheet, "
-        "or start RAM simulation, choose ram_wizard.\n"
-        "- If the user asks about DEM, discrete element modelling, PyChrono, bulk solids, particle flow, "
-        "transfer chutes, conveyor transitions, geometry for DEM, or DEM simulation/results, choose dem.\n"
-        "- If the user is supplying machine/date/file/category/simulation values while RAM wizard is active, choose ram_wizard.\n"
+        "- If the user wants to build an input sheet, run RAM, continue a wizard, review an input sheet, "
+        "or start simulation, choose ram_wizard.\n"
+        "- If the user is supplying machine/date/file/category/simulation values while wizard is active, choose ram_wizard.\n"
         "- If unclear, prefer qa.\n\n"
         "Output MUST be valid JSON with keys: intent, confidence, reason."
     )
@@ -326,14 +320,6 @@ def node_router(state: AgentState) -> AgentState:
 
     if wiz_active:
         state["intent"] = "ram_wizard"
-        return state
-
-    if t.lower().startswith("/dem"):
-        state["intent"] = "dem"
-        return state
-
-    if is_dem_related(t):
-        state["intent"] = "dem"
         return state
 
     try:
@@ -1512,10 +1498,6 @@ def node_ram_wizard(state: AgentState) -> AgentState:
     return state
 
 
-def node_dem(state: AgentState) -> AgentState:
-    return handle_dem_turn(state)
-
-
 # -------------------------
 # Graph build
 # -------------------------
@@ -1524,25 +1506,15 @@ def get_graph():
     builder.add_node("router", node_router)
     builder.add_node("qa", node_qa)
     builder.add_node("ram_wizard", node_ram_wizard)
-    builder.add_node("dem", node_dem)
 
     builder.set_entry_point("router")
 
     def _route(state: AgentState) -> str:
         return state.get("intent", "qa")
 
-    builder.add_conditional_edges(
-        "router",
-        _route,
-        {
-            "qa": "qa",
-            "ram_wizard": "ram_wizard",
-            "dem": "dem",
-        },
-    )
+    builder.add_conditional_edges("router", _route, {"qa": "qa", "ram_wizard": "ram_wizard"})
     builder.add_edge("qa", END)
     builder.add_edge("ram_wizard", END)
-    builder.add_edge("dem", END)
 
     use_sql = os.environ.get("USE_SQL_CHECKPOINTER", "1") == "1"
     if use_sql and SqliteSaver is not None:

@@ -1,4 +1,3 @@
-# agent/state.py
 from __future__ import annotations
 from typing import TypedDict, List, Dict, Any
 
@@ -14,6 +13,9 @@ class AgentState(TypedDict, total=False):
 
     # RAM run outputs / metadata
     ram: Dict[str, Any]
+
+    # DEM run outputs / metadata
+    dem: Dict[str, Any]
 
     # RAG (optional)
     rag_hits: List[Dict[str, Any]]

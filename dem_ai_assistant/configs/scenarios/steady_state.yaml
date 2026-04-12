@@ -1,0 +1,13 @@
+scenario_name: steady_state
+duration_s: 10.0
+timestep_s: 0.001
+
+feed_profile:
+  mode: constant
+  throughput_tph: 3200
+  surge_multiplier: 1.0
+
+restart_profile:
+  enabled: false
+  stop_time_s: 0.0
+  restart_ramp_s: 0.0

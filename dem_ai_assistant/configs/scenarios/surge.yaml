@@ -1,0 +1,13 @@
+scenario_name: surge
+duration_s: 12.0
+timestep_s: 0.001
+
+feed_profile:
+  mode: surge
+  throughput_tph: 4200
+  surge_multiplier: 1.3
+
+restart_profile:
+  enabled: false
+  stop_time_s: 0.0
+  restart_ramp_s: 0.0

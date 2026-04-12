@@ -1,0 +1,21 @@
+name: iron_ore_wet_fines
+bulk_density_kg_m3: 2200
+friction_particle_particle: 0.55
+friction_particle_wall: 0.48
+restitution: 0.20
+rolling_resistance: 0.08
+cohesion_pa: 1500
+
+psd_bands:
+  - size_min_mm: 0.0
+    size_max_mm: 5.0
+    mass_fraction: 0.25
+  - size_min_mm: 5.0
+    size_max_mm: 20.0
+    mass_fraction: 0.35
+  - size_min_mm: 20.0
+    size_max_mm: 50.0
+    mass_fraction: 0.25
+  - size_min_mm: 50.0
+    size_max_mm: 100.0
+    mass_fraction: 0.15

@@ -1,0 +1,13 @@
+scenario_name: stop_restart
+duration_s: 15.0
+timestep_s: 0.001
+
+feed_profile:
+  mode: restart_test
+  throughput_tph: 3200
+  surge_multiplier: 1.0
+
+restart_profile:
+  enabled: true
+  stop_time_s: 3.0
+  restart_ramp_s: 2.0

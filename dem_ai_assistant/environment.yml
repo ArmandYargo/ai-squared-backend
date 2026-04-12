@@ -1,0 +1,14 @@
+name: dem_ai_assistant
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - pyyaml
+  - matplotlib
+  - scipy
+  - pytest
+  - pip
+  - pip:
+      - pydantic>=2

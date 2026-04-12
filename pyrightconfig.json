@@ -1,5 +1,0 @@
-{
-  "extraPaths": ["ram_module"],
-  "venvPath": ".",
-  "venv": ".venv"
-}

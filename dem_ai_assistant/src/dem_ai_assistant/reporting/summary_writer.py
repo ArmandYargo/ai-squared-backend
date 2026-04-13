@@ -1,10 +1,14 @@
 from src.dem_ai_assistant.core.models import EngineeringFinding, KPIResult, SimulationResult
+from src.dem_ai_assistant.engineering.recommendation_engine import (
+    build_single_run_recommendation_lines,
+)
 
 
 def build_summary(
     sim_result: SimulationResult,
     kpis: KPIResult,
     findings: list[EngineeringFinding],
+    include_recommendations: bool = True,
 ) -> str:
     lines = [
         "=" * 70,
@@ -31,6 +35,13 @@ def build_summary(
     for idx, finding in enumerate(findings, start=1):
         lines.append(f"{idx}. [{finding.severity.upper()}] {finding.title}")
         lines.append(f"   {finding.detail}")
+
+    if include_recommendations:
+        lines.append("")
+        lines.append("Recommendations (rule-based)")
+        lines.append("-" * 70)
+        for bullet in build_single_run_recommendation_lines(kpis, findings):
+            lines.append(f"- {bullet}")
 
     lines.append("")
     return "\n".join(lines)

@@ -5,3 +5,5 @@ matplotlib
 scipy
 pydantic>=2
 pytest
+# Project Chrono: use conda/mamba only — do NOT `pip install pychrono` (wrong package on PyPI).
+#   conda install projectchrono::pychrono -c conda-forge

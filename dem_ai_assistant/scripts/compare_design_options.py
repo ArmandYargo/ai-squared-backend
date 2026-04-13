@@ -41,22 +41,22 @@ def _load_geometry(path: Path) -> GeometryConfig:
 
 
 def main() -> None:
-    scenario_files = [
-        "steady_state.yaml",
-        "surge.yaml",
-        "stop_restart.yaml",
-    ]
-
+    scenario_cfg = _load_scenario(PROJECT_ROOT / "configs" / "scenarios" / "surge.yaml")
     material_cfg = _load_material(
         PROJECT_ROOT / "configs" / "materials" / "iron_ore_wet_fines.yaml"
     )
-    geometry_cfg = _load_geometry(
-        PROJECT_ROOT / "configs" / "geometry" / "transfer_point_template.yaml"
-    )
+
+    design_option_files = [
+        "option_01_baseline.yaml",
+        "option_02_tighter_skirt.yaml",
+        "option_03_longer_transition.yaml",
+    ]
 
     comparison_cases: list[ComparisonCase] = []
-    for scenario_file in scenario_files:
-        scenario_cfg = _load_scenario(PROJECT_ROOT / "configs" / "scenarios" / scenario_file)
+    for option_file in design_option_files:
+        geometry_cfg = _load_geometry(
+            PROJECT_ROOT / "configs" / "design_options" / option_file
+        )
         run_dir, raw_output = execute_case(
             base_runs_dir=PROJECT_ROOT / "runs",
             material_config=material_cfg,
@@ -65,7 +65,7 @@ def main() -> None:
         )
         comparison_cases.append(
             ComparisonCase(
-                case_name=scenario_cfg.scenario_name,
+                case_name=geometry_cfg.transfer_point_name,
                 run_dir=run_dir,
                 kpis=calculate_kpis(raw_output),
             )
@@ -73,21 +73,26 @@ def main() -> None:
 
     baseline_case = comparison_cases[0].case_name
     comparison_result = build_comparison_result(
-        comparison_name="scenario_comparison",
+        comparison_name="design_option_comparison",
         cases=comparison_cases,
         baseline_case=baseline_case,
     )
 
     comparison_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     comparison_dir = (
-        PROJECT_ROOT / "runs" / "comparisons" / f"scenario_comparison_{comparison_id}"
+        PROJECT_ROOT / "runs" / "comparisons" / f"design_option_comparison_{comparison_id}"
     )
     json_path, txt_path = save_comparison_outputs(
         comparison_dir=comparison_dir,
         comparison=comparison_result,
     )
 
+    top_ranked = comparison_result.ranking[0]
     print(build_comparison_summary(comparison_result))
+    print(
+        f"Recommended option (simple KPI score): {top_ranked.case_name} "
+        f"(score={top_ranked.score:.2f})"
+    )
     print(f"Saved JSON report: {json_path}")
     print(f"Saved text report: {txt_path}")
 

@@ -1,0 +1,16 @@
+study_name: transfer_point_study_v1
+material_file: iron_ore_wet_fines.yaml
+
+scenario_files:
+  - steady_state.yaml
+  - surge.yaml
+  - stop_restart.yaml
+
+design_option_files:
+  - option_01_baseline.yaml
+  - option_02_tighter_skirt.yaml
+  - option_03_longer_transition.yaml
+
+baseline_option_file: option_01_baseline.yaml
+
+solver_name: placeholder

@@ -1,0 +1,18 @@
+transfer_point_name: head_end_transfer_A_option_01
+
+belt:
+  width_mm: 1800
+  speed_m_s: 4.5
+  trough_angle_deg: 35
+  transition_length_mm: 6000
+
+chute:
+  hood_angle_deg: 42
+  spoon_angle_deg: 38
+  skirt_spacing_mm: 120
+  lateral_offset_mm: 0
+
+egress_zone:
+  left_limit_mm: -900
+  right_limit_mm: 900
+  top_limit_mm: 700

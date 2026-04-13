@@ -1,3 +1,5 @@
+# Conda: conda env create -f environment.yml && conda activate dem_ai_assistant
+# Or use pip venv: powershell -File scripts/setup_project_env.ps1
 name: dem_ai_assistant
 channels:
   - conda-forge
@@ -10,5 +12,7 @@ dependencies:
   - scipy
   - pytest
   - pip
+  # Real multibody / granular-style runs (optional): after creating the env,
+  #   conda install projectchrono::pychrono -c conda-forge
   - pip:
       - pydantic>=2

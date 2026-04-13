@@ -43,7 +43,11 @@ class EgressZoneConfig(BaseModel):
 
 class GeometryConfig(BaseModel):
     transfer_point_name: str
+    # Path to triangle mesh for PyChrono collision (.obj preferred; .stl if supported).
+    # Export from CAD as mesh (watertight recommended for robust contact).
     cad_file: Optional[str] = None
+    # Uniform scale applied to mesh vertices (1.0 = file units taken as metres).
+    cad_mesh_scale: float = 1.0
     belt: BeltConfig
     chute: ChuteConfig
     egress_zone: EgressZoneConfig

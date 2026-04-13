@@ -1,0 +1,14 @@
+# Short scenario for testing the PyChrono transfer-slice solver (faster than production runs).
+scenario_name: pychrono_smoke
+duration_s: 0.45
+timestep_s: 0.002
+
+feed_profile:
+  mode: constant
+  throughput_tph: 2800
+  surge_multiplier: 1.0
+
+restart_profile:
+  enabled: false
+  stop_time_s: 0.0
+  restart_ramp_s: 0.0
